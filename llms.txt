@@ -1,0 +1,120 @@
+# @zakkster/lite-depth v1.0.0
+
+Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
+pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
+ESM. Node/browser. MIT. Author: Zahary Shinikchiev.
+
+Runtime deps: @zakkster/lite-arena, @zakkster/lite-fastbit32, @zakkster/lite-aabb.
+Optional cold-path peers: lite-signal (DI), lite-raf, lite-clock, lite-sprite-cache.
+
+## Model
+
+- A Stage owns an arena of nodes (SoA, generational handles), a pre-allocated
+  frame arena, and a Canvas2D ctx. Geometries and materials are registered once
+  and referenced by id; nodes instance them.
+- stage.frame(dt) runs: transform -> project -> collect+cull -> radix sort ->
+  paint. Entirely over pre-allocated storage: 0 alloc/frame. Structural mutation
+  (add/remove/reparent) is cold and may allocate.
+- Painter's algorithm: no depth buffer. Faces sorted back-to-front by a packed
+  Uint32 key: (layer<<26) | quantize26(centroidViewZ + depthBias). Far -> key 0
+  (painted first), near -> DEPTH_MAX (painted last).
+
+## Import
+
+    import { createStage, geometry, material, materialFromRamp,
+             createCamera, updateCamera, mathKernels, FLAGS, TAU, version }
+      from '@zakkster/lite-depth';
+
+## createStage(ctx, opts) -> Stage
+
+opts: { width, height, dpr, maxNodes, maxVerts, maxDrawFaces, camera }
+- maxVerts = TOTAL projected vertices across all visible instances per frame
+  (sphere(_,10,6) = 77 verts, box = 8). Undersizing silently drops geometry.
+- maxDrawFaces = total draw-face budget per frame.
+- camera: { fov, near, far, ortho, orthoScale, theta, phi, radius,
+  targetX/Y/Z }.
+
+## Geometry (register with stage.geometry(g) -> id)
+
+    geometry.box(w=1,h=1,d=1)              // 8 verts, 6 QUAD faces
+    geometry.plane(w=1,d=1)                // 4 verts, 1 face
+    geometry.sphere(r=0.5, segU=12, segV=8)
+    geometry.cylinder(r=0.5, h=1, seg=16)
+    geometry.cone(r=0.5, h=1, seg=16)
+    geometry.polyline(points)              // flat xyz array; kind='stroke', F=0
+    geometry.custom(verts, faces)          // verts flat xyz; faces = index loops
+Geometry fields: V, F, verts(Float32), faceVertOffset(Uint32,len F+1),
+faceVerts(Uint32), faceNormal(Float32), radius, kind ('fill'|'stroke').
+Quads/n-gons first-class. Normals via Newell's method.
+
+## Material (register with stage.material(m) -> id)
+
+    material({ r=90,g=200,b=120, ambient=0.35, steps=64, stroke=null,
+               lineWidth=2, fill=true })   // bakes a K-step hex ramp
+    materialFromRamp(hexRamp, { stroke, lineWidth, fill })  // e.g. lite-hueforge scale
+Per-frame shade is one LUT index: lut[(ndl*(K-1))|0]. No per-frame string build.
+
+## Nodes (Stage methods; h = generational NodeHandle)
+
+    h = stage.addNode(geomId, matId, { x, y, z, layer, parent })
+    stage.setPosition(h, x, y, z)
+    stage.setScale(h, x, y?, z?)           // uniform if y/z omitted
+    stage.setQuaternion(h, x, y, z, w)
+    stage.setEuler(h, ex, ey, ez)          // XYZ, radians
+    stage.setParent(h, parentHandle)       // 0/undefined = root; cold topo rebuild
+    stage.setLayer(h, 0..63)               // high bits of the sort key
+    stage.setDepthBias(h, bias)            // added to viewZ before quantize (popping fix)
+    stage.setVisible(h, bool)
+    stage.remove(h)                        // generational: stale handle invalidates
+    stage.resize(w, h, dpr?)
+Stale handles after remove() are safe: isAlive(h) is false, never aliases a
+recycled slot.
+
+## Frame + stats
+
+    const s = stage.frame(dt);
+    // s = { facesDrawn, facesCulled, nodesCulled, drawCalls,
+    //       tTransform, tProject, tSort, tPaint }   (ms)
+
+## Camera
+
+    updateCamera(stage.camera)             // cold; rebuild world->view after mutating
+    stage.camera.theta/phi/radius/tx/ty/tz/fov/near/far/ortho/orthoScale
+Interaction (drag/pinch/inertia) is NOT in core — wire pointer events to
+theta/phi/radius + updateCamera yourself, or use a companion driver.
+stage.view2d (Float64Array[6] or null): optional per-frame setTransform — the
+2D screen-space camera composition hook over the 3D scene.
+
+## lite-signal DI (cold path)
+
+    import { effect } from '@zakkster/lite-signal';
+    stage.useSignals({ effect });
+    stage.bind(h, 'position'|'scale'|'quaternion', () => signalGetter());
+Effect writes lanes + marks dirty on the cold path; frame loop only reads lanes.
+
+## Light
+
+stage.light is a normalized Float64Array[3] directional light. Flat per-face
+shading = clamp(dot(worldNormal, light), 0, 1), ambient floor from the material.
+
+## Math kernels (out-param, no classes; affine 3x4 row-major)
+
+    mathKernels.composeTRS(out12, tx,ty,tz, qx,qy,qz,qw, sx,sy,sz)
+    mathKernels.mulAffine(out12, A12, B12)     // out = A*B (parent*local)
+    mathKernels.quatRotate(out3, qx,qy,qz,qw, vx,vy,vz)
+
+## Gotchas
+
+- maxVerts/maxDrawFaces must cover the worst-case VISIBLE scene; sphere verts are
+  (segU+1)*(segV+1). Undersizing => silent OOB (dropped geometry, NaN artifacts).
+- Back-face cull uses screen winding; DOUBLE_SIDED flag disables it per node.
+- Depth key: far->0, near->DEPTH_MAX. depthBias shifts a node earlier/later.
+- Zero-alloc applies to frame(); creation/reconfiguration is cold and may allocate.
+- Verifying zero-GC: use @zakkster/lite-gc-profiler and await gc.settle() before
+  reading the summary — the perf_hooks GC observer delivers asynchronously.
+
+## Test / bench
+
+    npm test          # node:test; zero-GC test skips without --expose-gc
+    npm run test:gc   # --expose-gc; zero-GC contract engages
+    npm run bench     # vs Zdog + throughput sweep

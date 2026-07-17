@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="scope">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>lite-depth · zero-GC Canvas2D 3D · Zdog allocates, this doesn't</title>
+    <style>
+        :root {
+            --bg: #05070a;
+            --bg: oklch(0.13 0.014 200);
+            --panel: #0a0f14;
+            --panel: oklch(0.18 0.018 200);
+            --line: #16202a;
+            --line: oklch(0.27 0.022 200);
+            --ink: #b8cbd4;
+            --ink: oklch(0.82 0.021 200);
+            --dim: #5f7480;
+            --dim: oklch(0.58 0.020 210);
+            --green: #5fe3a1;
+            --green: oklch(0.86 0.17 158);
+            --cyan: #4fd9e8;
+            --cyan: oklch(0.84 0.12 205);
+            --magenta: #e86bd0;
+            --magenta: oklch(0.74 0.20 330);
+            --amber: #e8b45f;
+            --amber: oklch(0.82 0.14 78);
+            --grid: #0d141a;
+            --grid: oklch(0.20 0.018 200);
+            --radius: 0.375rem;
+            --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background: repeating-linear-gradient(0deg, transparent 0 2rem, var(--grid) 2rem 2.0625rem),
+            repeating-linear-gradient(90deg, transparent 0 2rem, var(--grid) 2rem 2.0625rem),
+            var(--bg);
+            color: var(--ink);
+            font: 0.8125rem/1.55 var(--mono);
+            min-height: 100dvh;
+            padding: 1rem;
+        }
+
+        .shell {
+            max-width: 90rem;
+            margin: 0 auto;
+        }
+
+        header {
+            display: flex;
+            align-items: baseline;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid var(--line);
+        }
+
+        h1 {
+            font-size: 0.9375rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            color: var(--green);
+        }
+
+        .pkg {
+            color: var(--dim);
+            font-size: 0.75rem;
+        }
+
+        .pkg b {
+            color: var(--cyan);
+            font-weight: 500;
+        }
+
+        .tag {
+            margin-left: auto;
+            font-size: 0.6875rem;
+            color: var(--amber);
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 0.125rem 0.625rem;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0.25rem;
+            margin: 0.75rem 0;
+            flex-wrap: wrap;
+        }
+
+        .tabs button {
+            font: inherit;
+            font-size: 0.75rem;
+            color: var(--dim);
+            background: transparent;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 0.4375rem 0.875rem;
+            cursor: pointer;
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            transition: color 120ms, border-color 120ms;
+        }
+
+        .tabs button[aria-current="true"] {
+            color: var(--green);
+            border-color: var(--green);
+        }
+
+        .scene-num {
+            color: var(--line);
+            font-size: 0.625rem;
+        }
+
+        .tabs button[aria-current="true"] .scene-num {
+            color: var(--green);
+        }
+
+        @media (hover: hover) {
+            .tabs button:hover:not([aria-current="true"]) {
+                color: var(--ink);
+            }
+        }
+
+        main {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 19rem;
+            gap: 0.75rem;
+        }
+
+        .stage-wrap {
+            display: grid;
+        }
+
+        .scene {
+            grid-area: 1 / 1;
+            display: none;
+            min-width: 0;
+        }
+
+        .scene[data-active] {
+            display: block;
+        }
+
+        .stage {
+            position: relative;
+            width: 100%;
+            height: 32rem;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: #000;
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            touch-action: pan-y pinch-zoom;
+        }
+
+        .hint {
+            position: absolute;
+            left: 0.75rem;
+            bottom: 0.625rem;
+            color: var(--dim);
+            font-size: 0.6875rem;
+            pointer-events: none;
+            text-shadow: 0 1px 2px #000;
+        }
+
+        .panel {
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--panel);
+            padding: 0.875rem;
+            align-self: start;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .panel-head {
+            color: var(--dim);
+            font-size: 0.6875rem;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .panel h3 {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--cyan);
+            margin-top: 0.25rem;
+        }
+
+        .ctl {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3125rem;
+        }
+
+        .ctl label {
+            display: flex;
+            justify-content: space-between;
+            color: var(--dim);
+            font-size: 0.6875rem;
+        }
+
+        .ctl label b {
+            color: var(--ink);
+            font-weight: 500;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            accent-color: var(--green);
+            height: 1.25rem;
+        }
+
+        .row {
+            display: flex;
+            gap: 0.375rem;
+            flex-wrap: wrap;
+        }
+
+        .row button {
+            font: inherit;
+            font-size: 0.6875rem;
+            color: var(--dim);
+            background: transparent;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 0.3125rem 0.625rem;
+            cursor: pointer;
+        }
+
+        .row button[aria-pressed="true"] {
+            color: var(--green);
+            border-color: var(--green);
+        }
+
+        @media (hover: hover) {
+            .row button:hover {
+                color: var(--ink);
+            }
+        }
+
+        .tele {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 0.1875rem 0.75rem;
+            font-size: 0.75rem;
+        }
+
+        .tele span:nth-child(odd) {
+            color: var(--dim);
+        }
+
+        .tele span:nth-child(even) {
+            color: var(--ink);
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .tele .hi {
+            color: var(--green);
+        }
+
+        .badge {
+            border: 1px solid var(--green);
+            border-radius: var(--radius);
+            padding: 0.5rem 0.625rem;
+            color: var(--green);
+            font-size: 0.6875rem;
+            text-align: center;
+            letter-spacing: 0.03em;
+        }
+
+        .badge b {
+            color: var(--cyan);
+        }
+
+        .spark {
+            width: 100%;
+            height: 3rem;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: #000;
+            display: block;
+        }
+
+        .note {
+            color: var(--dim);
+            font-size: 0.6875rem;
+            border-top: 1px solid var(--line);
+            padding-top: 0.625rem;
+        }
+
+        .note b {
+            color: var(--amber);
+            font-weight: 500;
+        }
+
+        @media (width < 60rem
+
+        ) {
+            main {
+                grid-template-columns: minmax(0, 1fr);
+            }
+
+            .stage {
+                height: 24rem;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="shell">
+    <header>
+        <h1>lite-depth</h1>
+        <span class="pkg">zero-GC Canvas2D software-projected 3D · <b>@zakkster/lite-arena</b> · <b>lite-fastbit32</b> · <b>lite-aabb</b></span>
+        <span class="tag">0 bytes / frame</span>
+    </header>
+
+    <nav class="tabs" id="tabs">
+        <button data-tab="gallery" aria-current="true"><span class="scene-num">01</span>Primitive Gallery</button>
+        <button data-tab="stress"><span class="scene-num">02</span>Zero-GC Stress Field</button>
+        <button data-tab="zbias"><span class="scene-num">03</span>Z-Bias / Layer</button>
+    </nav>
+
+    <main>
+        <div class="stage-wrap">
+            <section class="scene" data-scene="gallery" data-active>
+                <div class="stage">
+                    <canvas id="gallery-canvas"></canvas>
+                    <span class="hint">drag to orbit · box · sphere · cylinder · cone · plane · polyline</span></div>
+            </section>
+            <section class="scene" data-scene="stress">
+                <div class="stage">
+                    <canvas id="stress-canvas"></canvas>
+                    <span class="hint">drag to orbit · every node re-oriented every frame</span></div>
+            </section>
+            <section class="scene" data-scene="zbias">
+                <div class="stage">
+                    <canvas id="zbias-canvas"></canvas>
+                    <span class="hint">two interpenetrating slabs · painter popping vs the packed sort key</span></div>
+            </section>
+        </div>
+
+        <aside class="panel" id="panel">
+            <!-- gallery controls -->
+            <div data-panel="gallery">
+                <div class="panel-head">scene 01 · projection + shading</div>
+                <h3>light direction</h3>
+                <div class="ctl"><label>azimuth <b id="g-azV">—</b></label><input type="range" id="g-az" min="0"
+                                                                                  max="360" value="45"></div>
+                <div class="ctl"><label>elevation <b id="g-elV">—</b></label><input type="range" id="g-el" min="-80"
+                                                                                    max="80" value="40"></div>
+                <div class="row">
+                    <button id="g-auto" aria-pressed="true">auto-orbit</button>
+                </div>
+                <div class="tele">
+                    <span>faces drawn</span><span id="g-fd" class="hi">—</span>
+                    <span>back-face culled</span><span id="g-fc">—</span>
+                    <span>draw calls (style-runs)</span><span id="g-dc">—</span>
+                </div>
+                <div class="note">Six primitives, one <b>painter pass</b>. Flat per-face shading via a pre-baked
+                    fillStyle LUT — no per-frame string building.
+                </div>
+            </div>
+
+            <!-- stress controls -->
+            <div data-panel="stress" hidden>
+                <div class="panel-head">scene 02 · the whole pitch</div>
+                <h3>node count</h3>
+                <div class="ctl"><label>nodes <b id="s-nV">—</b></label><input type="range" id="s-n" min="200"
+                                                                               max="8000" step="100" value="3000"></div>
+                <div class="badge">frame path: <b>0 B/frame · 0 GC</b><br>proven by lite-gc-profiler</div>
+                <canvas class="spark" id="s-spark" width="512" height="96"></canvas>
+                <div class="tele">
+                    <span>faces drawn</span><span id="s-fd" class="hi">—</span>
+                    <span>faces culled</span><span id="s-fc">—</span>
+                    <span>nodes frustum-cut</span><span id="s-nc">—</span>
+                    <span>frame time</span><span id="s-ft" class="hi">—</span>
+                    <span>fps</span><span id="s-fps">—</span>
+                    <span>transform</span><span id="s-tt">—</span>
+                    <span>project</span><span id="s-tp">—</span>
+                    <span>sort</span><span id="s-ts">—</span>
+                    <span>paint</span><span id="s-tpaint">—</span>
+                </div>
+                <div class="note">Every node dirty every frame — worst case for transform + project + radix sort +
+                    paint. Allocation stays at <b>zero</b> regardless of count.
+                </div>
+            </div>
+
+            <!-- zbias controls -->
+            <div data-panel="zbias" hidden>
+                <div class="panel-head">scene 03 · the escape hatch</div>
+                <h3>packed sort key</h3>
+                <div class="ctl"><label>depth bias (red slab) <b id="z-bV">—</b></label><input type="range" id="z-b"
+                                                                                               min="-8" max="8"
+                                                                                               step="0.1" value="0">
+                </div>
+                <div class="row">
+                    <button id="z-layer" aria-pressed="false">force red to top layer</button>
+                </div>
+                <div class="row">
+                    <button id="z-auto" aria-pressed="true">auto-orbit</button>
+                </div>
+                <div class="tele">
+                    <span>red key layer</span><span id="z-lay" class="hi">0</span>
+                    <span>faces drawn</span><span id="z-fd">—</span>
+                </div>
+                <div class="note">Centroid depth-sort pops on interpenetrating meshes. A per-node <b>depthBias</b>
+                    nudges the quantized key; a <b>layer</b> bit forces ordering outright — one mechanism, both fixes,
+                    zero sort cost.
+                </div>
+            </div>
+        </aside>
+    </main>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-depth": "../Depth.js",
+    "@zakkster/lite-arena": "https://esm.sh/@zakkster/lite-arena@1.0.1",
+    "@zakkster/lite-fastbit32": "https://esm.sh/@zakkster/lite-fastbit32@1.2.0",
+    "@zakkster/lite-aabb": "https://esm.sh/@zakkster/lite-aabb@1.0.0"
+  }
+}
+
+</script>
+
+<script type="module">
+    import {createStage, geometry, material, updateCamera, TAU} from '@zakkster/lite-depth';
+
+    /* ── cached DOM refs (all lookups at init) ── */
+    const $tabs = document.getElementById('tabs');
+    const $panels = document.querySelectorAll('[data-panel]');
+    const $scenes = document.querySelectorAll('[data-scene]');
+
+    const $gCanvas = document.getElementById('gallery-canvas');
+    const $gAz = document.getElementById('g-az'), $gAzV = document.getElementById('g-azV');
+    const $gEl = document.getElementById('g-el'), $gElV = document.getElementById('g-elV');
+    const $gAuto = document.getElementById('g-auto');
+    const $gFd = document.getElementById('g-fd'), $gFc = document.getElementById('g-fc'),
+        $gDc = document.getElementById('g-dc');
+
+    const $sCanvas = document.getElementById('stress-canvas');
+    const $sN = document.getElementById('s-n'), $sNV = document.getElementById('s-nV');
+    const $sSpark = document.getElementById('s-spark'), $sSparkCtx = $sSpark.getContext('2d');
+    const $sFd = document.getElementById('s-fd'), $sFc = document.getElementById('s-fc'),
+        $sNc = document.getElementById('s-nc');
+    const $sFt = document.getElementById('s-ft'), $sFps = document.getElementById('s-fps');
+    const $sTt = document.getElementById('s-tt'), $sTp = document.getElementById('s-tp'),
+        $sTs = document.getElementById('s-ts'), $sTpaint = document.getElementById('s-tpaint');
+
+    const $zCanvas = document.getElementById('zbias-canvas');
+    const $zB = document.getElementById('z-b'), $zBV = document.getElementById('z-bV');
+    const $zLayer = document.getElementById('z-layer'), $zAuto = document.getElementById('z-auto');
+    const $zLay = document.getElementById('z-lay'), $zFd = document.getElementById('z-fd');
+
+    /* ── throttled textContent write (only touches the DOM on change) ── */
+    const hud = ($el, v) => {
+        if ($el._v !== v) {
+            $el._v = v;
+            $el.textContent = v;
+        }
+    };
+    const f1 = (x) => (Math.round(x * 10) / 10).toFixed(1);
+    const f2 = (x) => (Math.round(x * 100) / 100).toFixed(2);
+    const fmtN = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : '' + n;
+
+    /* ── shared canvas sizing (cold) ── */
+    function fit(canvas, stage) {
+        const r = canvas.getBoundingClientRect();
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+        if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+            canvas.width = w * dpr;
+            canvas.height = h * dpr;
+            stage.resize(w, h, dpr);
+        }
+    }
+
+    /* ── drag-orbit, implemented inline per demo JS rules (no camera dep in core) ── */
+    function attachOrbit(canvas, cam, state) {
+        let dragging = false, lx = 0, ly = 0;
+        canvas.addEventListener('pointerdown', (e) => {
+            dragging = true;
+            lx = e.clientX;
+            ly = e.clientY;
+            canvas.setPointerCapture(e.pointerId);
+            state.auto = false;
+            if (state.onManual) state.onManual();
+        });
+        canvas.addEventListener('pointermove', (e) => {
+            if (!dragging) return;
+            cam.theta -= (e.clientX - lx) * 0.008;
+            cam.phi -= (e.clientY - ly) * 0.008;
+            if (cam.phi < 0.15) cam.phi = 0.15; else if (cam.phi > TAU * 0.24) cam.phi = TAU * 0.24;
+            lx = e.clientX;
+            ly = e.clientY;
+            updateCamera(cam);
+        });
+        canvas.addEventListener('pointerup', (e) => {
+            dragging = false;
+            canvas.releasePointerCapture(e.pointerId);
+        });
+    }
+
+    /* ═══════════ scene 01 · primitive gallery ═══════════ */
+    const gStage = createStage($gCanvas.getContext('2d'), {
+        width: 800,
+        height: 512,
+        maxNodes: 16,
+        maxVerts: 4096,
+        maxDrawFaces: 4096,
+        camera: {radius: 7.5, theta: 0.6, phi: 1.05, near: 0.1, far: 60}
+    });
+    const gGeo = [
+        gStage.geometry(geometry.box(1.4, 1.4, 1.4)),
+        gStage.geometry(geometry.sphere(0.95, 16, 12)),
+        gStage.geometry(geometry.cylinder(0.8, 1.6, 20)),
+        gStage.geometry(geometry.cone(0.9, 1.7, 20)),
+        gStage.geometry(geometry.plane(1.8, 1.8)),
+        gStage.geometry(geometry.polyline(spiral(1.0, 3.2, 48))),
+    ];
+    const gCol = [[95, 227, 161], [79, 217, 232], [232, 107, 208], [232, 180, 95], [140, 200, 255], [180, 255, 180]];
+    const gMat = gCol.map((c, i) => gStage.material(material({
+        r: c[0],
+        g: c[1],
+        b: c[2],
+        ambient: 0.32,
+        stroke: i === 5 ? '#b6ffb6' : null,
+        lineWidth: 2.5
+    })));
+    const gNodes = [];
+    for (let i = 0; i < 6; i++) {
+        const a = TAU * i / 6;
+        const h = gStage.addNode(gGeo[i], gMat[i], {x: Math.cos(a) * 2.7, y: 0, z: Math.sin(a) * 2.7});
+        gNodes.push(h);
+    }
+    const gState = {
+        auto: true, onManual() {
+            $gAuto.setAttribute('aria-pressed', 'false');
+        }
+    };
+    attachOrbit($gCanvas, gStage.camera, gState);
+
+    function galleryFrame(dt, f) {
+        if (gState.auto) {
+            gStage.camera.theta += dt * 0.00018;
+            updateCamera(gStage.camera);
+        }
+        const spin = f * 0.012;
+        for (let i = 0; i < 6; i++) gStage.setEuler(gNodes[i], spin * 0.7, spin, spin * 0.3);
+        const s = gStage.frame(dt);
+        if ((f & 7) === 0) {
+            hud($gFd, s.facesDrawn);
+            hud($gFc, s.facesCulled);
+            hud($gDc, s.drawCalls);
+        }
+    }
+
+    /* ═══════════ scene 02 · zero-GC stress field ═══════════ */
+    const S_MAX = 8000;
+    const sStage = createStage($sCanvas.getContext('2d'), {
+        width: 800,
+        height: 512,
+        maxNodes: S_MAX + 4,
+        maxVerts: (S_MAX + 4) * 8,
+        maxDrawFaces: (S_MAX + 4) * 6,
+        camera: {radius: 62, theta: 0.7, phi: 1.05, near: 0.5, far: 400}
+    });
+    const sBox = sStage.geometry(geometry.box(1, 1, 1));
+    const sMat = [];
+    for (let i = 0; i < 6; i++) {
+        const t = i / 5;
+        sMat.push(sStage.material(material({r: 70 + t * 160, g: 210 - t * 80, b: 150 + (1 - t) * 90, ambient: 0.3})));
+    }
+    const sNodes = new Array(S_MAX);
+    const sSpin = new Float64Array(S_MAX);
+    for (let i = 0; i < S_MAX; i++) {
+        const th = (i * 2.399963) % TAU, ph = (i * 0.9) % Math.PI, r = 8 + (i % 44);
+        sNodes[i] = sStage.addNode(sBox, sMat[i % 6], {
+            x: r * Math.sin(ph) * Math.cos(th),
+            y: r * Math.cos(ph),
+            z: r * Math.sin(ph) * Math.sin(th)
+        });
+        sSpin[i] = 0.3 + (i % 17) * 0.05;
+    }
+    let sCount = 3000;
+
+    function setStressCount(n) {
+        n = n | 0;
+        for (let i = 0; i < S_MAX; i++) sStage.setVisible(sNodes[i], i < n);
+        sCount = n;
+    }
+
+    setStressCount(3000);
+    const sState = {
+        auto: true, onManual() {
+        }
+    };
+    attachOrbit($sCanvas, sStage.camera, sState);
+    /* frame-time sparkline: power-of-2 ring, zero-alloc */
+    const RING = 128, RING_MASK = RING - 1;
+    const sRing = new Float32Array(RING);
+    let sRingHead = 0;
+    let sFpsT = 0, sFpsN = 0, sFps = 0;
+
+    function stressFrame(dt, f, now) {
+        if (sState.auto) {
+            sStage.camera.theta += dt * 0.00012;
+            updateCamera(sStage.camera);
+        }
+        const t = f * 0.016;
+        for (let i = 0; i < sCount; i++) sStage.setEuler(sNodes[i], t * sSpin[i], t * sSpin[i] * 0.7, t * 0.3);
+        const s = sStage.frame(dt);
+        const ft = s.tTransform + s.tProject + s.tSort + s.tPaint;
+        sRing[sRingHead & RING_MASK] = ft;
+        sRingHead++;
+        sFpsN++;
+        if (now - sFpsT >= 500) {
+            sFps = Math.round(sFpsN * 1000 / (now - sFpsT));
+            sFpsT = now;
+            sFpsN = 0;
+        }
+        drawSpark();
+        if ((f & 7) === 0) {
+            hud($sFd, fmtN(s.facesDrawn));
+            hud($sFc, fmtN(s.facesCulled));
+            hud($sNc, fmtN(s.nodesCulled));
+            hud($sFt, f2(ft) + ' ms');
+            hud($sFps, sFps);
+            hud($sTt, f2(s.tTransform));
+            hud($sTp, f2(s.tProject));
+            hud($sTs, f2(s.tSort));
+            hud($sTpaint, f2(s.tPaint));
+        }
+    }
+
+    function drawSpark() {
+        const c = $sSparkCtx, W = $sSpark.width, H = $sSpark.height;
+        c.clearRect(0, 0, W, H);
+        let mx = 0.001;
+        for (let i = 0; i < RING; i++) if (sRing[i] > mx) mx = sRing[i];
+        c.strokeStyle = '#16202a';
+        c.lineWidth = 1;
+        c.beginPath();
+        c.moveTo(0, H - 1);
+        c.lineTo(W, H - 1);
+        c.stroke();
+        c.strokeStyle = '#5fe3a1';
+        c.lineWidth = 1.5;
+        c.beginPath();
+        for (let i = 0; i < RING; i++) {
+            const idx = (sRingHead + i) & RING_MASK, x = (i / (RING - 1)) * W, y = H - (sRing[idx] / mx) * (H - 4) - 2;
+            if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+        }
+        c.stroke();
+    }
+
+    /* ═══════════ scene 03 · z-bias / layer playground ═══════════ */
+    const zStage = createStage($zCanvas.getContext('2d'), {
+        width: 800,
+        height: 512,
+        maxNodes: 8,
+        maxVerts: 1024,
+        maxDrawFaces: 1024,
+        camera: {radius: 7, theta: 0.5, phi: 1.15, near: 0.1, far: 60}
+    });
+    const zSlab = zStage.geometry(geometry.box(3.2, 0.5, 1.4));
+    const zMatBlue = zStage.material(material({r: 79, g: 217, b: 232, ambient: 0.34}));
+    const zMatRed = zStage.material(material({r: 232, g: 107, b: 128, ambient: 0.34}));
+    const zBlue = zStage.addNode(zSlab, zMatBlue, {x: 0, y: 0, z: 0});
+    const zRed = zStage.addNode(zSlab, zMatRed, {x: 0, y: 0, z: 0});
+    zStage.setEuler(zRed, 0, TAU / 4, 0);       // cross the two slabs -> interpenetration
+    const zState = {
+        auto: true, onManual() {
+            $zAuto.setAttribute('aria-pressed', 'false');
+        }
+    };
+    attachOrbit($zCanvas, zStage.camera, zState);
+    let zLayerOn = false;
+
+    function zbiasFrame(dt, f) {
+        if (zState.auto) {
+            zStage.camera.theta += dt * 0.0002;
+            updateCamera(zStage.camera);
+        }
+        const s = zStage.frame(dt);
+        if ((f & 7) === 0) {
+            hud($zFd, s.facesDrawn);
+            hud($zLay, zLayerOn ? 1 : 0);
+        }
+    }
+
+    /* ── scene registry + single rAF loop ── */
+    const scenes = {
+        gallery: {stage: gStage, canvas: $gCanvas, frame: galleryFrame},
+        stress: {stage: sStage, canvas: $sCanvas, frame: stressFrame},
+        zbias: {stage: zStage, canvas: $zCanvas, frame: zbiasFrame},
+    };
+    let active = 'gallery', frameN = 0, last = performance.now();
+
+    function loop(now) {
+        const dt = now - last;
+        last = now;
+        const sc = scenes[active];
+        fit(sc.canvas, sc.stage);
+        sc.frame(dt > 100 ? 16 : dt, frameN, now);
+        frameN++;
+        requestAnimationFrame(loop);
+    }
+
+    /* ── controls (cold path) ── */
+    function setLight(stage, azDeg, elDeg) {
+        const az = azDeg * Math.PI / 180, el = elDeg * Math.PI / 180, ce = Math.cos(el);
+        const L = stage.light;
+        L[0] = Math.cos(az) * ce;
+        L[1] = Math.sin(el);
+        L[2] = Math.sin(az) * ce;
+        const inv = 1 / (Math.hypot(L[0], L[1], L[2]) || 1);
+        L[0] *= inv;
+        L[1] *= inv;
+        L[2] *= inv;
+    }
+
+    const applyGalleryLight = () => {
+        hud($gAzV, $gAz.value + '°');
+        hud($gElV, $gEl.value + '°');
+        setLight(gStage, +$gAz.value, +$gEl.value);
+    };
+    $gAz.addEventListener('input', applyGalleryLight);
+    $gEl.addEventListener('input', applyGalleryLight);
+    $gAuto.addEventListener('click', () => {
+        gState.auto = !gState.auto;
+        $gAuto.setAttribute('aria-pressed', String(gState.auto));
+    });
+
+    $sN.addEventListener('input', () => {
+        hud($sNV, fmtN(+$sN.value));
+        setStressCount(+$sN.value);
+    });
+
+    $zB.addEventListener('input', () => {
+        const b = +$zB.value;
+        hud($zBV, f1(b));
+        zStage.setDepthBias(zRed, b);
+    });
+    $zLayer.addEventListener('click', () => {
+        zLayerOn = !zLayerOn;
+        $zLayer.setAttribute('aria-pressed', String(zLayerOn));
+        zStage.setLayer(zRed, zLayerOn ? 1 : 0);
+    });
+    $zAuto.addEventListener('click', () => {
+        zState.auto = !zState.auto;
+        $zAuto.setAttribute('aria-pressed', String(zState.auto));
+    });
+
+    /* ── tabs ── */
+    $tabs.addEventListener('click', (e) => {
+        const btn = e.target.closest('button');
+        if (!btn) return;
+        active = btn.dataset.tab;
+        for (const b of $tabs.querySelectorAll('button')) b.setAttribute('aria-current', String(b.dataset.tab === active));
+        for (const s of $scenes) {
+            if (s.dataset.scene === active) s.setAttribute('data-active', ''); else s.removeAttribute('data-active');
+        }
+        for (const p of $panels) p.hidden = p.dataset.panel !== active;
+    });
+
+    /* ── hook initial UI values from state, then start ── */
+    hud($sNV, fmtN(sCount));
+    hud($zBV, f1(0));
+    applyGalleryLight();
+    requestAnimationFrame(loop);
+
+    /* ── helpers ── */
+    function spiral(rInner, height, segs) {
+        const pts = [];
+        for (let i = 0; i <= segs; i++) {
+            const t = i / segs, a = t * TAU * 2.5, r = rInner * (0.35 + t * 0.65);
+            pts.push(Math.cos(a) * r, (t - 0.5) * height, Math.sin(a) * r);
+        }
+        return pts;
+    }
+</script>
+</body>
+</html>
