@@ -148,15 +148,22 @@ function build(n) {
     const a = i / n * TAU, r = R * (0.5 + 0.5 * ((i * 7) % n) / n);
     const node = stage.addNode((i & 1) ? gBox : gOct, mats[i % 3], {});
     const x0 = Math.cos(a) * r, z0 = Math.sin(a) * r;
+    // Per-clip phase (via play's `start`), divided by rate so the local offset is
+    // rate-independent: the ring pulses as a travelling wave, not one synchronised
+    // clap. Separated geometry is what the painter's per-face sort resolves exactly;
+    // a whole-ring collapse to centre is the one case it structurally cannot (many
+    // interpenetrating faces quantise to the same depth key). Convergence widened
+    // to 0.6r and peak scale trimmed to 1.15 so props no longer pile into one ball.
+    const phase = i / n * DUR;
     mixer.clip(node)
       .posKey(0, x0, -4, z0)
-      .posKey(DUR * 0.5, x0 * 0.3, 3.5, z0 * 0.3, 'easeOutCubic')
+      .posKey(DUR * 0.5, x0 * 0.6, 2.5, z0 * 0.6, 'easeOutCubic')
       .posKey(DUR, x0, -4, z0, 'easeInCubic')
       .quatEuler(0, 0, 0, 0)
       .quatEuler(DUR * 0.5, Math.PI, a, 0, 'easeInOutCubic')
       .quatEuler(DUR, TAU, TAU, 0, 'easeOutCubic')
-      .scaleKey(0, 0.6).scaleKey(DUR * 0.5, 1.5, 'easeInOutSine').scaleKey(DUR, 0.6, 'easeInOutSine')
-      .play({ duration: DUR, loop, timescale: rate });
+      .scaleKey(0, 0.6).scaleKey(DUR * 0.5, 1.15, 'easeInOutSine').scaleKey(DUR, 0.6, 'easeInOutSine')
+      .play({ duration: DUR, loop, timescale: rate, start: -phase / rate });
   }
   simT = 0;
 }
