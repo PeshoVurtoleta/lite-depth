@@ -4,9 +4,77 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.0] — 2026-07-17
+## [1.1.0] — 2026-07-18
 
-First public release. "Painter" — the pure Canvas2D core.
+"Motion" — an optional animation layer, shipped as the `@zakkster/lite-depth/motion`
+subpath. The core (`Depth.js`) is unchanged and gains no new required dependencies.
+
+### Added
+
+- **`@zakkster/lite-depth/motion` subpath** — `createMixer(stage, opts)` and a
+  chainable clip API. A **thin composer over the stack**, not a re-implementation:
+  [`lite-clock`](https://www.npmjs.com/package/@zakkster/lite-clock) is the
+  deterministic time base, [`lite-keyframe`](https://www.npmjs.com/package/@zakkster/lite-keyframe)'s
+  `KeyframePool` evaluates scalar channels, and [`lite-ease`](https://www.npmjs.com/package/@zakkster/lite-ease)
+  is the easing bank. These three are **optional peer dependencies** — install
+  them only if you import the subpath.
+- **Channels:** `posKey`, `scaleKey` (uniform or per-axis), `biasKey` (depth-bias),
+  `quatKey` / `quatEuler`. Each key takes an absolute time in seconds and an
+  optional easing name.
+- **Quaternion slerp tracks** — the one thing the stack lacks. Interpolating a
+  rotation as four independent scalar keyframe rows would denormalise and never
+  actually slerp, so Motion adds a dedicated quaternion arena with spherical
+  interpolation and an **nlerp fast path** at `dot > 0.9995`. Verified bit-exact
+  against gl-matrix on Float32-stored inputs; output stays unit-normalised.
+- **Loop modes** — once / loop / pingpong, plus `timescale`, `play` / `pause` /
+  `resume` / `stop` / `seek`, and `duration` inferred from the last key.
+- **Clock time base** — in clock mode the mixer reads `clock.simTime`, so global
+  pause / seek / replay and **golden-frame determinism** (identical `advance(dt)`
+  → byte-identical lanes) come from the clock. Standalone `update(dt)` mode is
+  kept for use without a clock.
+- `Motion.d.ts` declarations; five motion test files (`05`–`09`); an
+  oscilloscope-themed **timeline scrubber demo** (`demo/motion.html`).
+
+### Fixed (during hardening)
+
+- **`scaleKey(t, uniform, 'ease')` stored NaN.** The uniform-scale-with-easing
+  overload collided with the `(t, x, y, z, ease)` signature — the easing string
+  landed in the `y` slot and `z` was left undefined, writing NaN into `sy`/`sz`
+  and collapsing every transform (total face cull). `scaleKey` now detects a
+  string in the axis slots as the easing. Regression tests added.
+- **NON_UNIFORM_SCALE flag was set-only.** An animated scale that returned to
+  uniform left the flag stuck on; the update path now clears it when
+  `sx === sy === sz`. The core `stage.setScale` setter had the same set-only bug
+  and now clears the flag on a return to uniform as well.
+- **Orthographic projection was unreachable.** `createCamera` stored `ortho`/
+  `orthoScale` on the camera, but `stage.frame()` branched on `stage.ortho`
+  (never assigned), so `createStage(ctx, { camera: { ortho: true } })` silently
+  rendered perspective. `frame()` now reads `camera.ortho`.
+- **`Depth.js` version constant** was left at `1.0.0`; synced to `1.1.0` to match
+  `package.json`, `Motion.js`, and `llms.txt`.
+- Removed an unused `markDirty` helper.
+- **Unresolvable dependency range.** `@zakkster/lite-arena` was pinned to `^2.0.0`,
+  which does not exist (stable line is 1.9.0), so `npm install` failed with
+  ETARGET; corrected to `^1.9.0`. `@zakkster/lite-aabb@^2.0.0` is correct.
+- **Motion demo (`demo/motion.html`)** — the frame loop wrote HUD `textContent`
+  and ran `toFixed` every frame (allocating strings in a zero-GC demo); telemetry
+  is now gated to ~10Hz. `once` mode no longer froze the timeline scrubber: a
+  completed `once` clip re-arms when scrubbed back into range, and the loop
+  clamps rather than wraps `once` time. Dropped an unused `material` import.
+
+### Notes
+
+- **Zero-GC, measured as bytes/op.** The update path evaluates channels straight
+  into the arena's `Float64` lane arrays rather than through the stage setters —
+  a double passed as a *function argument* across a non-inlined call boundary can
+  be boxed as a `HeapNumber`, but the same double stored directly into a
+  `Float64Array` element is not. The zero-GC test gates on **allocated bytes per
+  op** (`measureOps`), not a raw scavenge count: a scavenge count is confounded
+  by wall-clock time, so it tracks how long a loop runs rather than how much it
+  allocates. A 1500-clip scene animating position + quaternion + scale every
+  frame holds at **0 GC over 20 000 ops** — the same bar as the render loop.
+
+
 
 ### Added
 

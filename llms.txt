@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.0.0
+# @zakkster/lite-depth v1.1.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -113,8 +113,54 @@ shading = clamp(dot(worldNormal, light), 0, 1), ambient floor from the material.
 - Verifying zero-GC: use @zakkster/lite-gc-profiler and await gc.settle() before
   reading the summary — the perf_hooks GC observer delivers asynchronously.
 
+## Motion subpath — @zakkster/lite-depth/motion (v1.1.0)
+
+Optional animation layer. Thin composer over the stack: lite-clock (time base),
+lite-keyframe KeyframePool (scalar channels), lite-ease (easing bank). Adds only
+quaternion slerp tracks + a clip table bound to node lanes. Optional peer deps:
+lite-clock, lite-keyframe, lite-ease (install only if you import this subpath).
+
+    import { createMixer } from '@zakkster/lite-depth/motion';
+    const mixer = createMixer(stage, { clock, maxClips, maxKeys, easings });
+
+createMixer(stage, opts) -> Mixer
+  opts: { clock?, maxClips=256, maxKeys=8, maxQuatKeys=8, easings? }
+  clock: a lite-clock (duck-typed via clock.simTime). Omit for standalone dt mode.
+  easings: array of lite-ease function names; index 0 should be 'linear'. Names
+           become the ids used by the `ease` argument on *Key calls.
+
+mixer.clip(nodeHandle) -> Clip   (chainable; all keys take time in SECONDS)
+  clip.posKey(t, x, y, z, ease?)
+  clip.scaleKey(t, s, ease?)                 // uniform
+  clip.scaleKey(t, x, y, z, ease?)           // per-axis (string in an axis slot = ease)
+  clip.biasKey(t, v, ease?)                  // depth-bias
+  clip.quatKey(t, x, y, z, w, ease?)         // slerp (nlerp fast path at dot>0.9995)
+  clip.quatEuler(t, ex, ey, ez, ease?)       // XYZ Euler radians -> quat
+  clip.play({ duration?, loop?, timescale?, start? })
+       duration inferred from last key if omitted; loop: 'loop'|'pingpong'|number
+  clip.pause() / resume() / stop() / seek(localSeconds)
+  clip.done / clip.playing
+
+mixer.update(dt)  // standalone: advance internal time by dt, then apply
+mixer.sync()      // clock mode: apply at clock.simTime (call after clock.advance)
+mixer.time / mixer.clipCount
+exports: createMixer, ONCE, LOOP, PINGPONG, version
+
+Time base / determinism: in clock mode global pause/seek/replay live on the clock;
+fixed advance(dt) gives golden-frame determinism (byte-identical lanes). The update
+path is allocation-free (channels write straight into Float64 lanes; 0 GC over
+20000 ops, gated on bytes/op not scavenge count).
+
+Motion gotchas:
+- Keyframe times are ABSOLUTE seconds within the clip, not normalized [0,1].
+- scaleKey uniform-with-ease: pass the ease as the 3rd arg, e.g.
+  scaleKey(t, 1.5, 'easeOutCubic') — a string in an axis slot is read as the ease.
+- Quaternion keyframe values are stored Float32 (slerp math is bit-exact; the
+  ~1e-7 delta vs a Float64 reference is storage precision, not error).
+
 ## Test / bench
 
-    npm test          # node:test; zero-GC test skips without --expose-gc
-    npm run test:gc   # --expose-gc; zero-GC contract engages
+    npm test          # node:test (9 files: core 01-04, motion 05-09);
+                      # both zero-GC tests skip without --expose-gc
+    npm run test:gc   # --expose-gc; zero-GC contracts engage
     npm run bench     # vs Zdog + throughput sweep

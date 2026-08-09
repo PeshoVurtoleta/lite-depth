@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-depth",
-  "version": "1.0.0",
-  "description": "Zero-GC Canvas2D software-projected 3D (flat-shaded, painter-sorted, pseudo-3D), arena-backed and allocation-free per frame.",
+  "version": "1.1.0",
+  "description": "Zero-GC Canvas2D software-projected 3D (flat-shaded, painter-sorted, pseudo-3D), arena-backed and allocation-free per frame. Optional `/motion` subpath adds a zero-GC keyframe + quaternion-slerp animation mixer.",
   "type": "module",
   "main": "./Depth.js",
   "module": "./Depth.js",
@@ -12,11 +12,19 @@
       "types": "./Depth.d.ts",
       "import": "./Depth.js",
       "default": "./Depth.js"
+    },
+    "./motion": {
+      "node": "./Motion.js",
+      "types": "./Motion.d.ts",
+      "import": "./Motion.js",
+      "default": "./Motion.js"
     }
   },
   "files": [
     "Depth.js",
     "Depth.d.ts",
+    "Motion.js",
+    "Motion.d.ts",
     "README.md",
     "CHANGELOG.md",
     "llms.txt",
@@ -45,6 +53,11 @@
     "isometric",
     "pseudo-3d",
     "game",
+    "animation",
+    "keyframe",
+    "tween",
+    "slerp",
+    "quaternion",
     "zakkster"
   ],
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
@@ -62,15 +75,17 @@
     "url": "https://github.com/sponsors/PeshoVurtoleta"
   },
   "dependencies": {
-    "@zakkster/lite-arena": "^1.0.1",
+    "@zakkster/lite-arena": "^1.9.0",
     "@zakkster/lite-fastbit32": "^1.2.0",
-    "@zakkster/lite-aabb": "^1.0.0"
+    "@zakkster/lite-aabb": "^2.0.0"
   },
   "peerDependencies": {
-    "@zakkster/lite-signal": "^1.4.0",
+    "@zakkster/lite-signal": "^1.2.0",
     "@zakkster/lite-raf": "^1.1.0",
     "@zakkster/lite-clock": "^1.0.0",
-    "@zakkster/lite-sprite-cache": "^1.0.0"
+    "@zakkster/lite-sprite-cache": "^1.0.0",
+    "@zakkster/lite-keyframe": "^1.0.1",
+    "@zakkster/lite-ease": "^1.1.0"
   },
   "peerDependenciesMeta": {
     "@zakkster/lite-signal": {
@@ -84,10 +99,19 @@
     },
     "@zakkster/lite-sprite-cache": {
       "optional": true
+    },
+    "@zakkster/lite-keyframe": {
+      "optional": true
+    },
+    "@zakkster/lite-ease": {
+      "optional": true
     }
   },
   "devDependencies": {
-    "@zakkster/lite-gc-profiler": ">=1.1.0",
+    "@zakkster/lite-clock": "^1.0.0",
+    "@zakkster/lite-keyframe": "^1.0.1",
+    "@zakkster/lite-ease": "^1.1.0",
+    "@zakkster/lite-gc-profiler": "^1.3.1",
     "gl-matrix": "^3.4.3",
     "zdog": "^1.1.3"
   },

@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.0.0 "Painter")
+ * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.1.0 "Painter")
  *
  * Zdog's niche — flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
  * canvas — but arena-backed and allocation-free on the frame loop. Zdog allocates
@@ -39,6 +39,7 @@ const F_VISIBLE = 1 << FLAGS.get('VISIBLE');
 const F_DIRTY = 1 << FLAGS.get('DIRTY');
 const F_DOUBLE = 1 << FLAGS.get('DOUBLE_SIDED');
 const F_STROKE = 1 << FLAGS.get('STROKE');
+const F_NONUNIF = 1 << FLAGS.get('NON_UNIFORM_SCALE');
 
 /* ───────────────────────── math kernels (out-param) ─────────────────────── */
 // No Vec3/Mat4 classes. Everything writes into caller buffers; module-level
@@ -364,12 +365,11 @@ export function createStage(ctx, opts) {
     return h;
   };
 
-  const markDirty = (h) => { const d = nodes.idx(h); nodes.data.flags[d] |= F_DIRTY; };
   stage.setPosition = (h, x, y, z) => { const d = nodes.idx(h), D = nodes.data; D.px[d] = x; D.py[d] = y; D.pz[d] = z; D.flags[d] |= F_DIRTY; };
   stage.setScale = (h, x, y, z) => {
     const d = nodes.idx(h), D = nodes.data; D.sx[d] = x; D.sy[d] = y === undefined ? x : y; D.sz[d] = z === undefined ? x : z;
     D.flags[d] |= F_DIRTY;
-    if (!(x === D.sy[d] && x === D.sz[d])) D.flags[d] |= (1 << FLAGS.get('NON_UNIFORM_SCALE'));
+    if (x === D.sy[d] && x === D.sz[d]) D.flags[d] &= ~F_NONUNIF; else D.flags[d] |= F_NONUNIF;
   };
   stage.setQuaternion = (h, x, y, z, w) => { const d = nodes.idx(h), D = nodes.data; D.qx[d] = x; D.qy[d] = y; D.qz[d] = z; D.qw[d] = w; D.flags[d] |= F_DIRTY; };
   stage.setEuler = (h, ex, ey, ez) => {
@@ -473,7 +473,8 @@ export function createStage(ctx, opts) {
     const cam = stage.camera, V = cam.view;
     const near = cam.near, far = cam.far;
     const halfW = stage.width * 0.5, halfH = stage.height * 0.5;
-    const focal = stage.ortho ? 0 : (0.5 * Math.min(stage.width, stage.height)) / Math.tan(cam.fov * 0.5);
+    const ortho = cam.ortho;   // orthographic projection lives on the camera, not the stage
+    const focal = ortho ? 0 : (0.5 * Math.min(stage.width, stage.height)) / Math.tan(cam.fov * 0.5);
     const orthoK = (Math.min(stage.width, stage.height) * 0.5) / cam.orthoScale;
     const zSpan = (far - near) || 1;         // positive span; maps viewZ [-far,-near] -> [0, DEPTH_MAX]
     let vc = 0, dc = 0;
@@ -502,7 +503,7 @@ export function createStage(ctx, opts) {
         const vz = V[8] * wx + V[9] * wy + V[10] * wz + V[11];
         const idx = vc + v;
         viewZ[idx] = vz;
-        if (stage.ortho) { screenXY[idx * 2] = halfW + vx * orthoK; screenXY[idx * 2 + 1] = halfH - vy * orthoK; }
+        if (ortho) { screenXY[idx * 2] = halfW + vx * orthoK; screenXY[idx * 2 + 1] = halfH - vy * orthoK; }
         else { const inv = focal / (-vz); screenXY[idx * 2] = halfW + vx * inv; screenXY[idx * 2 + 1] = halfH - vy * inv; }
       }
       vc += GV;
@@ -633,4 +634,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.0.0';
+export const version = '1.1.0';

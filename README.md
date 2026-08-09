@@ -4,6 +4,10 @@
 > Primitive gallery, a zero-GC stress field with live telemetry, and the
 > Z-bias / layer escape-hatch playground. Run it with `npx serve .` and open
 > `demo/demo.html`.
+>
+> **[DEPTH // MOTION](demo/motion.html)** *(v1.1.0)* — a clock-driven timeline
+> scrubber: scrub, play, and pingpong a field of props animated with
+> keyframed position, quaternion slerp, and scale. Open `demo/motion.html`.
 
 > Zero-GC Canvas2D software-projected 3D. Zdog's niche — flat-shaded,
 > painter-sorted, pseudo-3D on a 2D canvas — but arena-backed and allocation-free
@@ -14,10 +18,10 @@
 ![Zero-GC](https://img.shields.io/badge/Zero--GC-Frame%20loop-00C853?style=for-the-badge&logo=leaf&logoColor=white)
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-depth?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-depth)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-depth?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-depth)
-[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-debth?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-debth)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-depth?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-depth)
 ![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational?style=flat-square)
-[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE.txt)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 **Zdog allocates; lite-depth doesn't.** Same flat-shaded pseudo-3D on a 2D
 canvas — projection, painter's-algorithm depth sort, primitives, hierarchy,
@@ -186,31 +190,102 @@ per shape per frame — structural to its design, not a tuning artifact.
 > performance bars are pinned on a 10-year-old MacBook Pro (primary) and
 > iPhone 11 / mid Android (secondary).
 
+## Motion — the animation layer (v1.1.0)
+
+`@zakkster/lite-depth/motion` is an optional subpath: a zero-GC keyframe mixer
+that drives node lanes over time. It's a **thin composer over the stack**, not a
+re-implementation — [`lite-clock`](https://www.npmjs.com/package/@zakkster/lite-clock)
+is the deterministic time base, [`lite-keyframe`](https://www.npmjs.com/package/@zakkster/lite-keyframe)
+evaluates scalar channels, [`lite-ease`](https://www.npmjs.com/package/@zakkster/lite-ease)
+is the easing bank. Motion adds only what the stack lacks: **quaternion slerp
+tracks** (with an nlerp fast path — interpolating a quaternion as four scalar
+keyframe rows would denormalise and never actually slerp), loop/pingpong
+wrapping, and the clip table that binds channels to lite-depth nodes.
+
+```bash
+npm install @zakkster/lite-depth @zakkster/lite-clock @zakkster/lite-keyframe @zakkster/lite-ease
+```
+
+The motion deps are **optional peers** — the core (`@zakkster/lite-depth`)
+installs without them; add them only if you import the `/motion` subpath.
+
+```js
+import { createStage, geometry, material } from '@zakkster/lite-depth';
+import { createClock } from '@zakkster/lite-clock';
+import { createMixer } from '@zakkster/lite-depth/motion';
+
+const clock = createClock({ capacity: 512 });
+const mixer = createMixer(stage, { clock, maxClips: 512 });
+
+mixer.clip(diceHandle)
+  .posKey(0, -3, 0, 0)
+  .posKey(1,  0, 2, 0, 'easeOutCubic')
+  .posKey(2,  3, 0, 0, 'easeInQuad')
+  .quatEuler(0, 0, 0, 0)
+  .quatEuler(2, 0, Math.PI, 0, 'easeInOutCubic')
+  .scaleKey(0, 1).scaleKey(2, 1.4, 'easeInOutSine')
+  .play({ duration: 2, loop: 'pingpong' });
+
+// deterministic drive — fixed advance(dt) gives golden-frame reproducibility
+requestAnimationFrame(function loop() {
+  clock.advance(1 / 60);   // pause/seek/replay all live on the clock
+  mixer.sync();            // eval channels -> write node lanes (zero alloc)
+  stage.frame(16);
+  requestAnimationFrame(loop);
+});
+```
+
+**Channels per clip:** `posKey`, `scaleKey` (uniform or per-axis), `quatKey` /
+`quatEuler`, `biasKey` (depth-bias). Each key takes a time in seconds and an
+optional easing name. `play({ duration, loop, timescale, start })` — `duration`
+is inferred from the last key when omitted; `loop` is `'loop'` / `'pingpong'` /
+a numeric mode. Lifecycle: `pause` / `resume` / `stop` / `seek(local)`, plus
+`clip.done` / `clip.playing`.
+
+**Time base.** In clock mode the mixer reads `clock.simTime`, so global
+pause/seek/replay and golden-frame determinism come from the clock, not a
+re-implementation. Standalone mode (`mixer.update(dt)`) keeps its own time when
+you don't want a clock.
+
+**Zero-GC, measured honestly.** The update path evaluates channels straight into
+the arena's `Float64` lane arrays (never boxing an eval result across a setter
+call boundary) and slerps quaternions through a single module-scratch register.
+Gated on **allocated bytes per op** (`measureOps` heap-delta, not a raw scavenge
+count — a scavenge count tracks wall-clock time, not heap growth): a 1500-clip
+scene animating position + quaternion + scale every frame holds at the bytes/op
+noise floor with **0 GCs in the steady phase** — the same bar as the render loop.
+
 ## TypeScript
 
 Full declarations ship as `Depth.d.ts` — `Stage`, `Geometry`, `Material`,
 `Camera`, `StageStats`, `NodeHandle`, `FlagName`, and the `geometry` / `material`
-/ `mathKernels` namespaces are all typed.
+/ `mathKernels` namespaces are all typed. The motion subpath ships `Motion.d.ts`
+(`Mixer`, `Clip`, `MixerOptions`, `PlayOptions`, loop-mode constants).
 
 ## Testing
 
-`node:test` (no test-runner dependency), four files:
+`node:test` (no test-runner dependency), nine files — core (01–04) and motion (05–09):
 
 ```bash
-npm test            # correctness; the zero-GC test skips without --expose-gc
-npm run test:gc     # adds --expose-gc; the zero-GC contract engages
+npm test            # correctness; the zero-GC tests skip without --expose-gc
+npm run test:gc     # adds --expose-gc; the zero-GC contracts engage
 npm run bench       # vs-Zdog head-to-head + throughput sweep
 ```
 
 | File | Covers |
 |---|---|
-| `test/01-math.test.js`      | composeTRS / quatRotate / mulAffine vs gl-matrix (forced Float64) — bit-exact |
-| `test/02-geometry.test.js`  | primitive vertex/face counts, unit face normals, CSR offset validity |
-| `test/03-pipeline.test.js`  | back-face cull == true facing (500 poses), radix sort (spread + full-order depth monotonicity), near/frustum cull, generational-handle safety, hierarchy world transform |
-| `test/04-zero-gc.test.js`   | steady-state render loop 0 major / 0 minor GC via lite-gc-profiler (skips without `--expose-gc`) |
+| `test/01-math.test.js`               | composeTRS / quatRotate / mulAffine vs gl-matrix (forced Float64) — bit-exact |
+| `test/02-geometry.test.js`           | primitive vertex/face counts, unit face normals, CSR offset validity |
+| `test/03-pipeline.test.js`           | back-face cull == true facing (500 poses), radix sort (spread + full-order depth monotonicity), near/frustum cull, generational-handle safety, hierarchy world transform |
+| `test/04-zero-gc.test.js`            | steady-state render loop 0 major / 0 minor GC (skips without `--expose-gc`) |
+| `test/05-motion-scalar.test.js`      | position / scale / bias channel interpolation, per-segment easing, duration inference |
+| `test/06-motion-quaternion.test.js`  | slerp vs gl-matrix (bit-exact on Float32-stored inputs), unit-normalisation, nlerp fast path |
+| `test/07-motion-timeline.test.js`    | once / loop / pingpong wrapping, pause / resume, timescale |
+| `test/08-motion-determinism.test.js` | golden-frame: identical advance(dt) sequence → byte-identical lane state |
+| `test/09-motion-zero-gc.test.js`     | animation update path at bytes/op noise floor, 0 steady GC (skips without `--expose-gc`) |
 
-The `04-zero-gc` test skips without `--expose-gc` so `npm test` runs cleanly;
-`npm run test:gc` engages it.
+The two `zero-gc` tests skip without `--expose-gc` so `npm test` runs cleanly;
+`npm run test:gc` engages them.
 
 ## License
 
