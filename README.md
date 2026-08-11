@@ -5,7 +5,7 @@
 > Z-bias / layer escape-hatch playground. Run it with `npx serve .` and open
 > `demo/demo.html`.
 >
-> **[DEPTH // MOTION](demo/motion.html)** *(v1.1.0)* — a clock-driven timeline
+> **[DEPTH // MOTION](demo/motion.html)** *(v1.2.0)* — a clock-driven timeline
 > scrubber: scrub, play, and pingpong a field of props animated with
 > keyframed position, quaternion slerp, and scale. Open `demo/motion.html`.
 
@@ -190,7 +190,7 @@ per shape per frame — structural to its design, not a tuning artifact.
 > performance bars are pinned on a 10-year-old MacBook Pro (primary) and
 > iPhone 11 / mid Android (secondary).
 
-## Motion — the animation layer (v1.1.0)
+## Motion — the animation layer (v1.2.0)
 
 `@zakkster/lite-depth/motion` is an optional subpath: a zero-GC keyframe mixer
 that drives node lanes over time. It's a **thin composer over the stack**, not a

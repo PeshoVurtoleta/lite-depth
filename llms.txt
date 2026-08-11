@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.1.0
+# @zakkster/lite-depth v1.2.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -113,7 +113,7 @@ shading = clamp(dot(worldNormal, light), 0, 1), ambient floor from the material.
 - Verifying zero-GC: use @zakkster/lite-gc-profiler and await gc.settle() before
   reading the summary — the perf_hooks GC observer delivers asynchronously.
 
-## Motion subpath — @zakkster/lite-depth/motion (v1.1.0)
+## Motion subpath — @zakkster/lite-depth/motion (v1.2.0)
 
 Optional animation layer. Thin composer over the stack: lite-clock (time base),
 lite-keyframe KeyframePool (scalar channels), lite-ease (easing bank). Adds only
@@ -160,7 +160,8 @@ Motion gotchas:
 
 ## Test / bench
 
-    npm test          # node:test (9 files: core 01-04, motion 05-09);
+    npm test          # node:test (6 files: core 01/03/04, motion 06/07/09);
                       # both zero-GC tests skip without --expose-gc
     npm run test:gc   # --expose-gc; zero-GC contracts engage
+    npm run torture   # node --expose-gc test/torture.mjs -> prints "ok" (zero-GC gate)
     npm run bench     # vs Zdog + throughput sweep

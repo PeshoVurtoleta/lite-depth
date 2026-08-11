@@ -220,9 +220,9 @@
   "imports": {
     "@zakkster/lite-depth": "../Depth.js",
     "@zakkster/lite-depth/motion": "../Motion.js",
-    "@zakkster/lite-arena": "https://esm.sh/@zakkster/lite-arena@1",
-    "@zakkster/lite-fastbit32": "https://esm.sh/@zakkster/lite-fastbit32@1",
-    "@zakkster/lite-aabb": "https://esm.sh/@zakkster/lite-aabb@1",
+    "@zakkster/lite-arena": "https://esm.sh/@zakkster/lite-arena@1.9",
+    "@zakkster/lite-fastbit32": "https://esm.sh/@zakkster/lite-fastbit32@1.2",
+    "@zakkster/lite-aabb": "https://esm.sh/@zakkster/lite-aabb@2",
     "@zakkster/lite-keyframe": "https://esm.sh/@zakkster/lite-keyframe@1",
     "@zakkster/lite-ease": "https://esm.sh/@zakkster/lite-ease@1"
   }
@@ -301,7 +301,7 @@
             maxNodes: MAX + 4,
             maxVerts: (MAX + 4) * 40,
             maxDrawFaces: (MAX + 4) * 40,
-            camera: {radius: 14, theta: 0.7, phi: 1.02, near: 0.4, far: 120}
+            camera: {radius: 12.5 + n * 0.06, theta: 0.7, phi: 1.02, near: 0.4, far: 120}
         });
         const gBox = stage.geometry(geometry.box(1, 1, 1));
         const gOct = stage.geometry(geometry.sphere(0.75, 6, 4));
@@ -309,26 +309,34 @@
         mixer = createMixer(stage, {maxClips: MAX + 4});
         DUR = 4;
         const loop = $loop.value, rate = +$rate.value;
-        const R = 6.5;
+        // Count-aware composition. The painter's per-face sort resolves SEPARATED
+        // geometry exactly; its one structural blind spot is many interpenetrating
+        // faces quantising to the same depth key. Two levers keep areal density --
+        // and thus overlap -- roughly constant as n climbs 12 -> 64, so the max-count
+        // scene is as clean as the min:
+        //   R    grows with n, so the base ring spreads angularly instead of packing.
+        //   peak shrinks with n, so denser scenes use smaller props (more gaps).
+        // Convergence is held at 0.72r (not the old 0.6): the mid-animation bloom
+        // keeps an OPEN annulus rather than crushing every prop into one central ball
+        // -- the painter's worst case. The per-clip phase (play's rate-divided `start`)
+        // still staggers the ring into a travelling wave, not a synchronised clap.
+        // Camera radius (above) pulls back with n to keep the wider ring framed.
+        const R = 5 + n * 0.10;                           // 12->6.2, 32->8.2, 64->11.4
+        const CONV = 0.72;                                // mid-bloom radius factor
+        const peak = Math.max(0.70, 1.30 - n * 0.0095);   // 12->1.19, 32->1.00, 64->0.70
         for (let i = 0; i < n; i++) {
             const a = i / n * TAU, r = R * (0.5 + 0.5 * ((i * 7) % n) / n);
             const node = stage.addNode((i & 1) ? gBox : gOct, mats[i % 3], {});
             const x0 = Math.cos(a) * r, z0 = Math.sin(a) * r;
-            // Per-clip phase (via play's `start`), divided by rate so the local offset is
-            // rate-independent: the ring pulses as a travelling wave, not one synchronised
-            // clap. Separated geometry is what the painter's per-face sort resolves exactly;
-            // a whole-ring collapse to centre is the one case it structurally cannot (many
-            // interpenetrating faces quantise to the same depth key). Convergence widened
-            // to 0.6r and peak scale trimmed to 1.15 so props no longer pile into one ball.
             const phase = i / n * DUR;
             mixer.clip(node)
                 .posKey(0, x0, -4, z0)
-                .posKey(DUR * 0.5, x0 * 0.6, 2.5, z0 * 0.6, 'easeOutCubic')
+                .posKey(DUR * 0.5, x0 * CONV, 2.5, z0 * CONV, 'easeOutCubic')
                 .posKey(DUR, x0, -4, z0, 'easeInCubic')
                 .quatEuler(0, 0, 0, 0)
                 .quatEuler(DUR * 0.5, Math.PI, a, 0, 'easeInOutCubic')
                 .quatEuler(DUR, TAU, TAU, 0, 'easeOutCubic')
-                .scaleKey(0, 0.6).scaleKey(DUR * 0.5, 1.15, 'easeInOutSine').scaleKey(DUR, 0.6, 'easeInOutSine')
+                .scaleKey(0, 0.6).scaleKey(DUR * 0.5, peak, 'easeInOutSine').scaleKey(DUR, 0.6, 'easeInOutSine')
                 .play({duration: DUR, loop, timescale: rate, start: -phase / rate});
         }
         simT = 0;

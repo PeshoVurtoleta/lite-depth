@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth/motion — v1.1.0 "Motion" animation layer for lite-depth.
+ * @zakkster/lite-depth/motion — v1.2.0 "Motion" animation layer for lite-depth.
  *
  * A thin composer over the stack, not a re-implementation:
  *   - time base   = @zakkster/lite-clock   (deterministic advance(dt), simTime)
@@ -234,4 +234,4 @@ export function createMixer(stage, opts) {
   return mixer;
 }
 
-export const version = '1.1.0';
+export const version = '1.2.0';

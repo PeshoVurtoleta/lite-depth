@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth/motion — v1.1.0 animation layer for lite-depth.
+ * @zakkster/lite-depth/motion — v1.2.0 animation layer for lite-depth.
  * Composes lite-clock (time base), lite-keyframe (scalar channels) and
  * lite-ease (easing bank); adds quaternion slerp tracks and a clip table
  * bound to lite-depth node lanes. Allocation-free update path.

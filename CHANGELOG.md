@@ -4,6 +4,58 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-08-12
+
+Publish-readiness and observability. No change to the hot path: the per-vertex
+and per-face loop bodies in `frame()` are byte-identical to 1.1.0 (verified by
+diff and by the new zero-alloc gate); every addition below lands in a cold path.
+
+### Added
+
+- **Torture gate** -- `test/torture.mjs`, run via `npm run torture`
+  (`node --expose-gc test/torture.mjs` -> prints `ok`, exit 0), wired into
+  `verify` and a new `prepublishOnly`. Three self-controlling phases: retention
+  (4096 spawn/despawn cycles, dual witness -- arena pool conservation +
+  [`lite-leak`](https://www.npmjs.com/package/@zakkster/lite-leak) tracker), GC
+  budget (2000-node all-dirty stage, 20000 hot frames at 0 B/op under
+  [`lite-gc-profiler`](https://www.npmjs.com/package/@zakkster/lite-gc-profiler),
+  gated `maxMajor:0` / `maxPauseMs:4` / `maxArrayBuffersGrowth:0`), and an
+  always-on inverted control that fails closed if the gate ever stops catching a
+  real allocation. `DEPTH_TORTURE_LEAK=1` exercises the retention control.
+- **Observability stats** -- `stats.nodesTotal` (live node count each frame),
+  plus `stats.facesOverflowed` and `stats.nodesInvalid` (reserved always-zero
+  hooks). Integer stores in the cold preamble, outside both loops.
+- **Read-only draw-list handles** -- `stage._order` / `stage._drawCount` are now
+  read-only getters over the internal ping-pong buffers (re-pointed per frame,
+  no allocation), replacing the previously writable properties. Frozen as
+  observation-only so downstream re-laning cannot silently regress them.
+- `test/10-stats-drawlist.test.js` -- boundary coverage for the stats fields and
+  the read-only draw-list contract.
+
+### Changed
+
+- **devDependencies** -- `lite-gc-profiler` floor raised to `^1.11.0`;
+  `lite-leak ^1.8.0` added for the torture gate. The optional `lite-signal`
+  peer range widened to `^1.2.0 || >=1.5.0-alpha` (cold-path DI only; depth
+  never imports signal), with a dev-scoped `overrides` pinning `lite-clock`'s
+  signal subtree so the two dev tools coexist. No effect on consumers.
+- **Demo importmap** (`demo/motion.html`) -- pinned to the shipped major/minor
+  lines: `lite-aabb@2` (was `@1`), `lite-arena@1.9`, `lite-fastbit32@1.2`.
+- **Demo composition** (`demo/motion.html`) -- the prop ring is now count-aware:
+  radius grows and peak scale shrinks with prop count, and convergence widened
+  0.60r -> 0.72r, so the max-count (64) scene stays spatially separated instead
+  of collapsing into the painter's overlap worst case. Demo-only, cold build
+  path; the frame loop is unchanged.
+
+### Fixed
+
+- **Packaging** -- `files[]` referenced `LICENSE.txt` but the file on disk is
+  `LICENSE`, so the license was silently absent from the tarball; corrected the
+  manifest entry. Added the required maintainer email to the `LICENSE`
+  copyright line.
+- **Docs** -- reconciled the test-count drift in `llms.txt` (claimed 9, tree has
+  6) and `ROADMAP.md`.
+
 ## [1.1.0] — 2026-07-18
 
 "Motion" — an optional animation layer, shipped as the `@zakkster/lite-depth/motion`

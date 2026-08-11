@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.1.0 "Painter")
+ * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.2.0 "Painter")
  *
  * Zdog's niche — flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
  * canvas — but arena-backed and allocation-free on the frame loop. Zdog allocates
@@ -313,6 +313,13 @@ export function createStage(ctx, opts) {
   const orderB = new Uint32Array(maxDrawFaces);
   const hist = new Uint32Array(256);
 
+  // read-only observation handles over the sorted draw list. Backing vars are
+  // re-pointed at whichever ping-pong buffer holds the final permutation each
+  // frame -- NO per-frame allocation. Exposed via getters (no setter) so nothing
+  // can mutate the handle; D3 will re-lane these later.
+  let _pubOrder = orderA;
+  let _pubDrawCount = 0;
+
   // topo scratch (O(n) rebuild: memoized depth + counting sort by depth)
   const topo = new Uint32Array(maxNodes);         // dense indices, parent-before-child
   const parentDense = new Int32Array(maxNodes);   // -1 root, else dense idx (valid per frame)
@@ -331,8 +338,14 @@ export function createStage(ctx, opts) {
     light: new Float64Array([0.4, 0.8, 0.5]),   // normalized below
     view2d: null,                                // optional external 2D transform (lite-camera)
     _signals: null,
-    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0 },
+    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesTotal: 0 },
     _topoDirty: true,
+    // read-only views of the current draw ordering (observation handles only).
+    // Accessors declared in the literal so they are part of the stage's initial
+    // hidden class -- defining them later via Object.defineProperty would push the
+    // object toward dictionary mode and deopt every stage.* read on the hot path.
+    get _order() { return _pubOrder; },
+    get _drawCount() { return _pubDrawCount; },
   };
   stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY };
   stage._geometries = geometries;
@@ -431,6 +444,10 @@ export function createStage(ctx, opts) {
     if (stage._topoDirty) rebuildTopo();
     const st = stage.stats;
     st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0;
+    // Observability hooks (always-zero for now; D3 populates overflow/invalid).
+    // Integer stores OUTSIDE both hot loops: nodesTotal is the live node count,
+    // the other two are 0 placeholders. No per-vertex/per-face body was touched.
+    st.facesOverflowed = 0; st.nodesInvalid = 0; st.nodesTotal = count;
 
     // cache lane refs (monomorphic locals)
     const px = D.px, py = D.py, pz = D.pz, qx = D.qx, qy = D.qy, qz = D.qz, qw = D.qw, sx = D.sx, sy = D.sy, sz = D.sz;
@@ -562,8 +579,9 @@ export function createStage(ctx, opts) {
     }
     st.tSort = clock.now() - t;
 
-    /* expose sorted draw list (cheap; used by tests + HUD) */
-    stage._order = src; stage._drawCount = dc;
+    /* expose sorted draw list (cheap; used by tests + HUD) -- re-point the
+       read-only backing vars, no allocation */
+    _pubOrder = src; _pubDrawCount = dc;
 
     /* paint */
     t = clock.now();
@@ -634,4 +652,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.1.0';
+export const version = '1.2.0';
