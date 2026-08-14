@@ -26,6 +26,8 @@ export interface Geometry {
   readonly V: number;
   /** Face count (0 for stroke geometries). */
   readonly F: number;
+  /** Draw-list entries emitted per visible node: `F` for fills, `1` for strokes. Gates the overflow door. */
+  readonly drawSlots: number;
   /** Local-space vertices, xyz interleaved (Float32, memory-dense). */
   readonly verts: Float32Array;
   /** CSR offset table into `faceVerts`, length F+1. */
@@ -97,6 +99,14 @@ export interface StageStats {
   tProject: number;
   tSort: number;
   tPaint: number;
+  /** Nodes skipped by the frame-arena overflow door (vert or draw-face budget exceeded). */
+  facesOverflowed: number;
+  /** Reserved always-zero hook for the NaN/invalid-node reject (wired in a later milestone). */
+  nodesInvalid: number;
+  /** Nodes whose parent handle was dead/recycled this frame and were reparented to ROOT. */
+  nodesOrphaned: number;
+  /** Live node count this frame. */
+  nodesTotal: number;
 }
 
 /** Opaque generational node handle (lite-arena). Stale handles invalidate, never alias. */
@@ -150,6 +160,27 @@ export interface Stage {
   setVisible(h: NodeHandle, visible: boolean): void;
   remove(h: NodeHandle): void;
   resize(w: number, h: number, dpr?: number): void;
+
+  /**
+   * Remove every node in place (advances all generations, so every handle minted
+   * before clear() is invalid afterward) and reset the live count to 0. Geometries,
+   * materials, camera, frame arenas and capacity are kept. Bumps structureEpoch.
+   * Allocates nothing. Returns the stage for chaining.
+   */
+  clear(): Stage;
+  /**
+   * Grow all node-capacity-sized lanes to hold `n` nodes (cold, between frames).
+   * Returns false (a defined no-op) when `n <= current capacity`, true after a
+   * successful grow. Throws on a non-integer or negative `n`. Bumps structureEpoch.
+   */
+  reserve(n: number): boolean;
+  /** Free node slots remaining before the arena is full (capacity - live count). */
+  readonly remainingNodes: number;
+  /**
+   * Monotonic Uint32 (wraps) bumped by addNode/remove/setParent/clear. The single
+   * invalidation signal for any cached dense index (read-only).
+   */
+  readonly structureEpoch: number;
 
   /** Provide a lite-signal effect() so bind() can wire cold-path reactivity. */
   useSignals(api: SignalApi): Stage;

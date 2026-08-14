@@ -100,21 +100,21 @@ hygiene/contract gap.
 
 | ID | Sev | Finding | Reproduction |
 | --- | --- | --- | --- |
-| **D-01** | **S1** | **Hand-decomposed handles, failing open.** `rebuildTopo` resolves a parent with `sparse[ph & INDEX_MASK]` (`Depth.js:405`, local `INDEX_MASK = 0xFFFFF` at line 27). lite-arena's contract: "Handle layout is opaque. Never decompose entity handles by hand." There is no liveness check, so a parent handle whose node was despawned resolves to whatever entity now occupies that slot -- the child silently inherits a stranger's world matrix, or index `0`'s. The generational handle exists to prevent exactly this and is being bypassed. | `p = addNode(); c = addNode(_,_,{parent:p}); remove(p); addNode();` -> `c` follows the new node |
-| **D-02** | S1 | Same decomposition in the **hot** path: `Motion.js:210` does `sparse[cNode[id] & INDEX_MASK]` once per clip per frame. Same fail-open, plus a per-frame lookup that a cold cache would remove entirely. | animate a clip on a node, despawn the node, keep updating |
+| **D-01** | RESOLVED | ~~**Hand-decomposed handles, failing open.** `rebuildTopo` resolves a parent with `sparse[ph & INDEX_MASK]`.~~ Fixed in v1.3.0 (D1): parent resolution is `nodes.has(ph) ? nodes.idx(ph) : -1`; a dead/recycled parent reparents to ROOT, bumps `stats.nodesOrphaned`, and is re-dirtied (`flags[d] |= F_DIRTY`) so `frame()` recomposes it at ROOT the same frame (the warm-path stale-transform miss caught by qa). `INDEX_MASK` deleted. | `p=addNode(); c=addNode(_,_,{parent:p}); remove(p); addNode();` -> c reparents to ROOT, `nodesOrphaned===1` |
+| **D-02** | RESOLVED | ~~Same decomposition in the **hot** path: `Motion.js:210` does `sparse[cNode[id] & INDEX_MASK]` once per clip per frame.~~ Fixed in v1.3.0: `Motion.js` resolves each clip's dense index through an `Int32Array` cache keyed by `stage.structureEpoch`, rebuilt cold on epoch change; hot path only reads it and skips dead nodes. `INDEX_MASK` deleted. | animate a clip, despawn the node, keep updating -> dead node skipped |
 | **D-03** | **S1** | **Flat shading ignores parent rotation.** `paint()` rotates the face normal by the node's LOCAL quaternion lanes (`Depth.js:614`, `qxL[d]..qwL[d]`) while the geometry is drawn from the WORLD matrix. Any child of a rotated parent is lit as if the parent were unrotated -- wrong for every hierarchical scene, and invisible in review because ambient makes it merely "look flat". | box parented to a node at `setEuler(0, PI/2, 0)`; faces light as if unrotated |
 | **D-04** | S2 | **`NON_UNIFORM_SCALE` is computed and never consumed.** `setScale` maintains `F_NONUNIF` (`Depth.js:372`) and nothing reads it. `quatRotate` assumes uniform scale, so a non-uniformly scaled node gets a wrong normal, silently, with a flag sitting right there that says so. Rev 3 promised an "inverse-transpose slow path". | `setScale(h, 3, 1, 1)` on a sphere -> shading unchanged |
 | **D-05** | S2 | **`material.fill` is documented and never read.** `material({ fill: false })` is in the API (`Depth.js:225`, llms.txt line 52) and `paint()` never consults it -- every face fills regardless. Per-face stroke/fill+stroke, promised by the header's "stroke-friendly" line (`Depth.js:4`), does not exist: only `kind === 'stroke'` polylines stroke. | `material({fill:false, stroke:'#f00'})` -> solid fill |
 | **D-06** | **S1** | **NaN sorts to the far plane instead of being rejected.** A NaN lane (the `scaleKey` NaN bug fixed in 1.1.0 is the precedent) yields NaN screen coords; `minx/maxx` keep their `1e9` sentinels, `aabb2.intersects` returns `false` for some faces but `quantize` returns `(NaN * DEPTH_MAX) | 0 === 0` for others, so a poisoned face paints FIRST, at the back, forever, with no counter incremented. NaN is laundered into a valid sort key. | write `NaN` into `D.px[d]`, then `frame()` -> `drawKey === 0`, `facesCulled` unchanged |
-| **D-07** | S2 | **Frame-arena overflow is silent by design.** `vc` and `dc` are never checked against `maxVerts` / `maxDrawFaces` (`Depth.js:509`, `547`). Typed arrays discard out-of-range writes, so an undersized stage drops geometry with zero signal. llms.txt admits this ("Undersizing silently drops geometry", "silent OOB") -- a documented footgun is still a footgun, and one compare per NODE (not per vertex) closes it. | `createStage(ctx,{maxVerts:16})` with two boxes -> second box vanishes |
-| **D-08** | S3 | No `stage.clear()`, no `stage.reserve()`, no `remainingNodes()`. A scene reload must build a whole new stage (every frame arena reallocated). lite-arena 1.9.0 ships `clear()` (O(capacity), allocates nothing) and `reserve()`; neither is surfaced. Retirement is invisible: `arena.spawn()`'s throw now names full-vs-retirement-shrunk and `addNode` passes it through unlabelled. | `stage.clear` -> `undefined` |
+| **D-07** | RESOLVED | ~~**Frame-arena overflow is silent by design.** `vc` and `dc` are never checked against `maxVerts` / `maxDrawFaces`.~~ Fixed in v1.3.0: a two-compare-per-node overflow door (`vc + g.V > maxVerts \|\| dc + g.drawSlots > maxDrawFaces`) skips the node and bumps `stats.facesOverflowed` -- no OOB write, no partial face. `drawSlots` (=1 for strokes, F for fills) closes the stroke fail-open the reviewer caught. 0 B/op unchanged. | `createStage(ctx,{maxVerts:16})` with two boxes -> `facesOverflowed>0`, no OOB |
+| **D-08** | RESOLVED | ~~No `stage.clear()`, no `stage.reserve()`, no `remainingNodes()`. A scene reload must build a whole new stage.~~ Fixed in v1.3.0: `stage.clear()` (wraps `arena.clear()`, 0 alloc, bumps epoch), `stage.reserve(n)` (grows all node-capacity lanes; `false` when `n<=capacity`, throws on bad arg), and the `stage.remainingNodes` getter shipped. `structureEpoch` added as the cache-invalidation signal. | `stage.clear()` -> stage; `remainingNodes` -> count |
 | **D-09** | S3 | **devDep floor too low for the gate the law requires.** `@zakkster/lite-gc-profiler ^1.3.1` (`package.json:114`). The torture spec needs `maxArrayBuffersGrowth` with `stabilize: 'deep'` and relies on unknown rule keys throwing (v1.10.0+). Under ^1.3.1 an unknown rule key may be ignored -- a gate that silently accepts a typo'd rule is decorative. No `@zakkster/lite-leak` devDep at all. | `package.json` |
 | **D-10** | RESOLVED | **No torture entry point.** ~~This package has no `test/torture.mjs`, no `torture` script, and no `prepublishOnly` gate.~~ Added `test/torture.mjs` (Phases A retention / B GC-budget / C inverted control), the `torture` script, and a `prepublishOnly: npm run verify` gate. `node --expose-gc test/torture.mjs` -> `ok`, exit 0; `DEPTH_TORTURE_LEAK=1` proves the gate is load-bearing. | `npm run torture` -> ok |
 | **D-11** | RESOLVED | **Docs-vs-tree drift in the test count.** llms.txt line 163 claimed "9 files: core 01-04, motion 05-09"; the tree actually has 6: `01-math`, `03-pipeline`, `04-zero-gc`, `06-motion-quaternion`, `07-motion-loop-scrub`, `09-motion-zero-gc` (02, 05, 08 never existed -- this row's own earlier "5" also miscounted, omitting 07). Reconciled: llms.txt now states "6 files: core 01/03/04, motion 06/07/09". | `ls test/*.test.js` -> 6 files |
 | **D-12** | S3 | **`aabb2` used at 3 of 22 ops, all in the wrong place.** Only `create`/`set`/`intersects` are used, and `set` + `intersects` fire twice per FACE in the hot body (`Depth.js:534-535`) -- two call boundaries where four inline compares would do, on the finest-grained loop in the package. Meanwhile the coarse node level, where a packed box would reject whole meshes at once, does a scalar radius test only. The dependency is being paid for at the worst granularity. | `Depth.js:520-548` |
 | **D-13** | RESOLVED | **`stats` cannot see the failure modes above.** Added `stats.nodesTotal` (live count) plus reserved always-zero `facesOverflowed` / `nodesInvalid` hooks, set in the cold preamble outside both loops. `stage._order` / `stage._drawCount` are now frozen as read-only getters (observation-only) and pinned by `test/10-stats-drawlist.test.js` -- the contract a test relied on is now written down. | `test/10-stats-drawlist.test.js` |
 | **D-14** | S3 | `PICKABLE`, `BILLBOARD`, `CAST_SHADOW` occupy bits in the frozen `FLAGS` namespace (`Depth.js:34`) and are read by nothing. Bits in a published namespace are a compatibility surface; three of eight are reserved for features not on any dated milestone. | `Depth.js:34-42` |
-| **D-15** | S3 | The cycle guard in `rebuildTopo` (`Depth.js:414`) treats a parent cycle as a root and continues -- silently. Fail-closed says a cycle is a caller bug that should be named. It is also untested. | `setParent(a,b); setParent(b,a)` -> renders, no signal |
+| **D-15** | RESOLVED | ~~The cycle guard in `rebuildTopo` treats a parent cycle as a root and continues -- silently.~~ Fixed in v1.3.0: a parent cycle throws an `Error` from `rebuildTopo` (cold) naming both nodes; pinned by `test/11`. | `setParent(a,b); setParent(b,a)` -> throws naming both |
 
 ### The one invariant that catches four of these at once
 
@@ -416,14 +416,24 @@ DONE WHEN
 ```
 
 ===============================================================================
-# D1 -- lite-depth v1.2.0 -- stop decomposing handles; own the lifecycle
+# D1 -- lite-depth v1.3.0 -- stop decomposing handles; own the lifecycle
 ===============================================================================
+
+> **SHIPPED as v1.3.0** (2026-08-15). VERSION DRIFT: D0 shipped as **v1.2.0**
+> rather than the planned 1.1.1 patch (it bundled the D-13 observability work into
+> a minor), so every brief from D1 on ships one minor above its original
+> `version_target`: **D1=1.3.0, D2=1.4.0, D3=1.5.0, D4=1.6.0**, and so on. The
+> `version_target` fields below are left at their original values as historical
+> anchors; the mapping in this note is authoritative. D1 closed findings D-01,
+> D-02, D-07, D-08, D-15 (all RESOLVED above). The overflow-door stroke fail-open
+> and the orphan warm-path stale transform were caught in review/qa and fixed
+> before ship.
 
 ```markdown
 ---
 package: "@zakkster/lite-depth"
-version_target: 1.2.0
-status: planned
+version_target: 1.2.0   # SHIPPED as 1.3.0 -- see drift note above
+status: SHIPPED (v1.3.0, 2026-08-15)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -545,7 +555,7 @@ DONE WHEN
 ```
 
 ===============================================================================
-# D2 -- lite-depth v1.3.0 -- the shading is wrong; the flags say so
+# D2 -- lite-depth v1.4.0 (target field says 1.3.0 -- see D1 drift note) -- the shading is wrong; the flags say so
 ===============================================================================
 
 ```markdown

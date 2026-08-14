@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-depth",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Zero-GC Canvas2D software-projected 3D (flat-shaded, painter-sorted, pseudo-3D), arena-backed and allocation-free per frame. Optional `/motion` subpath adds a zero-GC keyframe + quaternion-slerp animation mixer.",
   "type": "module",
   "main": "./Depth.js",

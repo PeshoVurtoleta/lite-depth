@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.2.0
+# @zakkster/lite-depth v1.3.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -70,11 +70,29 @@ Per-frame shade is one LUT index: lut[(ndl*(K-1))|0]. No per-frame string build.
 Stale handles after remove() are safe: isAlive(h) is false, never aliases a
 recycled slot.
 
+## Lifecycle (cold path; scene reload / capacity growth)
+
+    stage.clear()             // remove all nodes in place, keep capacity/geometry/
+                              // material/camera/arenas; 0 alloc; returns stage.
+                              // EVERY handle minted before clear() is invalid after.
+    stage.reserve(n)          // grow all node-capacity lanes to n; false if
+                              // n<=capacity, true after grow; throws on bad arg.
+    stage.remainingNodes      // getter: free node slots (capacity - live count)
+    stage.structureEpoch      // getter: Uint32, bumped by addNode/remove/setParent/
+                              // clear. Invalidation signal for cached dense indices.
+A parent handle that is dead/recycled when topology rebuilds reparents its child
+to ROOT and bumps stats.nodesOrphaned (fail closed, never inherits a stranger's
+matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
+
 ## Frame + stats
 
     const s = stage.frame(dt);
     // s = { facesDrawn, facesCulled, nodesCulled, drawCalls,
-    //       tTransform, tProject, tSort, tPaint }   (ms)
+    //       tTransform, tProject, tSort, tPaint,          (ms for the t* fields)
+    //       facesOverflowed,   // nodes skipped by the vert/draw-face overflow door
+    //       nodesInvalid,      // reserved always-zero hook (NaN reject, later milestone)
+    //       nodesOrphaned,     // nodes whose dead parent forced a ROOT reparent
+    //       nodesTotal }       // live node count this frame
 
 ## Camera
 
@@ -106,14 +124,16 @@ shading = clamp(dot(worldNormal, light), 0, 1), ambient floor from the material.
 ## Gotchas
 
 - maxVerts/maxDrawFaces must cover the worst-case VISIBLE scene; sphere verts are
-  (segU+1)*(segV+1). Undersizing => silent OOB (dropped geometry, NaN artifacts).
+  (segU+1)*(segV+1). Undersizing is now fail-closed: an over-budget node is
+  SKIPPED whole (two integer compares per node) and stats.facesOverflowed counts
+  it -- no out-of-range write, no partial face. Size up when facesOverflowed > 0.
 - Back-face cull uses screen winding; DOUBLE_SIDED flag disables it per node.
 - Depth key: far->0, near->DEPTH_MAX. depthBias shifts a node earlier/later.
 - Zero-alloc applies to frame(); creation/reconfiguration is cold and may allocate.
 - Verifying zero-GC: use @zakkster/lite-gc-profiler and await gc.settle() before
   reading the summary — the perf_hooks GC observer delivers asynchronously.
 
-## Motion subpath — @zakkster/lite-depth/motion (v1.2.0)
+## Motion subpath — @zakkster/lite-depth/motion (v1.3.0)
 
 Optional animation layer. Thin composer over the stack: lite-clock (time base),
 lite-keyframe KeyframePool (scalar channels), lite-ease (easing bank). Adds only

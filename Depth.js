@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.2.0 "Painter")
+ * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.3.0 "Painter")
  *
  * Zdog's niche — flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
  * canvas — but arena-backed and allocation-free on the frame loop. Zdog allocates
@@ -24,7 +24,6 @@ import { aabb2 } from '@zakkster/lite-aabb';
 /* ─────────────────────────────── constants ─────────────────────────────── */
 
 export const TAU = Math.PI * 2;
-const INDEX_MASK = 0xFFFFF;          // lite-arena low 20 bits = slot index
 const DEPTH_BITS = 26;               // 26-bit quantized depth key
 const DEPTH_MAX = (1 << DEPTH_BITS) - 1;
 const LAYER_SHIFT = DEPTH_BITS;      // layer occupies the high 6 bits (0..63)
@@ -132,7 +131,12 @@ function buildGeometry(verts, faces, kind) {
     const x = fverts[i * 3], y = fverts[i * 3 + 1], z = fverts[i * 3 + 2];
     const d = x * x + y * y + z * z; if (d > r2) r2 = d;
   }
-  return { V, F, verts: fverts, faceVertOffset, faceVerts, faceNormal, radius: Math.sqrt(r2), kind: kind || 'fill' };
+  const k = kind || 'fill';
+  // drawSlots = draw-list entries this geometry emits per visible node. A fill
+  // writes one entry per face (F); a stroke has F === 0 but writes exactly ONE
+  // whole-polyline entry. The overflow door reserves against this, not F, so a
+  // stroke cannot slip a write past a full draw list. Fill: drawSlots === F.
+  return { V, F, drawSlots: k === 'stroke' ? 1 : F, verts: fverts, faceVertOffset, faceVerts, faceNormal, radius: Math.sqrt(r2), kind: k };
 }
 
 export const geometry = {
@@ -274,7 +278,7 @@ export function updateCamera(cam) {
 
 export function createStage(ctx, opts) {
   const o = opts || {};
-  const maxNodes = o.maxNodes || 4096;
+  let maxNodes = o.maxNodes || 4096;
   const maxVerts = o.maxVerts || 262144;      // total projected verts per frame
   const maxDrawFaces = o.maxDrawFaces || 131072;
 
@@ -303,7 +307,7 @@ export function createStage(ctx, opts) {
   // frame arena (pre-allocated; Float64 hot output, Float32 aabb)
   const screenXY = new Float64Array(2 * maxVerts);
   const viewZ = new Float64Array(maxVerts);
-  const vertBase = new Int32Array(maxNodes);     // per dense-node projected vert base (this frame)
+  let vertBase = new Int32Array(maxNodes);       // per dense-node projected vert base (this frame)
   const drawKey = new Uint32Array(maxDrawFaces);
   const drawNode = new Uint32Array(maxDrawFaces); // dense node index
   const drawFace = new Uint32Array(maxDrawFaces);
@@ -320,13 +324,19 @@ export function createStage(ctx, opts) {
   let _pubOrder = orderA;
   let _pubDrawCount = 0;
 
+  // Structural-mutation epoch (Uint32, wrapping). Bumped by addNode / remove /
+  // setParent / clear -- the single invalidation signal for every dense-index
+  // cache in the package (Motion.js) and for any downstream consumer. Cold path
+  // only; frame() never writes it.
+  let _structureEpoch = 0;
+
   // topo scratch (O(n) rebuild: memoized depth + counting sort by depth)
-  const topo = new Uint32Array(maxNodes);         // dense indices, parent-before-child
-  const parentDense = new Int32Array(maxNodes);   // -1 root, else dense idx (valid per frame)
-  const recomputed = new Uint8Array(maxNodes);
-  const depthArr = new Int32Array(maxNodes);
-  const stackArr = new Uint32Array(maxNodes);
-  const levelOff = new Uint32Array(maxNodes);
+  let topo = new Uint32Array(maxNodes);           // dense indices, parent-before-child
+  let parentDense = new Int32Array(maxNodes);     // -1 root, else dense idx (valid per frame)
+  let recomputed = new Uint8Array(maxNodes);
+  let depthArr = new Int32Array(maxNodes);
+  let stackArr = new Uint32Array(maxNodes);
+  let levelOff = new Uint32Array(maxNodes);
 
   // aabb scratch (lite-aabb)
   const _box = aabb2.create();
@@ -338,7 +348,7 @@ export function createStage(ctx, opts) {
     light: new Float64Array([0.4, 0.8, 0.5]),   // normalized below
     view2d: null,                                // optional external 2D transform (lite-camera)
     _signals: null,
-    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesTotal: 0 },
+    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesOrphaned: 0, nodesTotal: 0 },
     _topoDirty: true,
     // read-only views of the current draw ordering (observation handles only).
     // Accessors declared in the literal so they are part of the stage's initial
@@ -346,6 +356,10 @@ export function createStage(ctx, opts) {
     // object toward dictionary mode and deopt every stage.* read on the hot path.
     get _order() { return _pubOrder; },
     get _drawCount() { return _pubDrawCount; },
+    // read-only structural epoch + remaining capacity. Declared in the literal so
+    // they belong to the stage's initial hidden class (same reason as above).
+    get structureEpoch() { return _structureEpoch; },
+    get remainingNodes() { return arena.remainingCapacity(); },
   };
   stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY };
   stage._geometries = geometries;
@@ -375,6 +389,7 @@ export function createStage(ctx, opts) {
       if (init.parent) D.parent[d] = init.parent;
     }
     stage._topoDirty = true;
+    _structureEpoch = (_structureEpoch + 1) >>> 0;
     return h;
   };
 
@@ -392,12 +407,56 @@ export function createStage(ctx, opts) {
     D.qy[d] = cx * sy * cz + sx * cy * sz; D.qz[d] = cx * cy * sz - sx * sy * cz;
     D.flags[d] |= F_DIRTY;
   };
-  stage.setParent = (h, parentHandle) => { const d = nodes.idx(h); nodes.data.parent[d] = parentHandle || 0; nodes.data.flags[d] |= F_DIRTY; stage._topoDirty = true; };
+  stage.setParent = (h, parentHandle) => { const d = nodes.idx(h); nodes.data.parent[d] = parentHandle || 0; nodes.data.flags[d] |= F_DIRTY; stage._topoDirty = true; _structureEpoch = (_structureEpoch + 1) >>> 0; };
   stage.setLayer = (h, layer) => { nodes.data.layer[nodes.idx(h)] = layer & 63; };
   stage.setDepthBias = (h, bias) => { nodes.data.bias[nodes.idx(h)] = bias; };
   stage.setVisible = (h, v) => { const d = nodes.idx(h), D = nodes.data; if (v) D.flags[d] |= F_VISIBLE; else D.flags[d] &= ~F_VISIBLE; };
-  stage.remove = (h) => { arena.despawn(h); stage._topoDirty = true; };
+  stage.remove = (h) => { arena.despawn(h); stage._topoDirty = true; _structureEpoch = (_structureEpoch + 1) >>> 0; };
   stage.resize = (w, hh, dpr) => { stage.width = w; stage.height = hh; stage.dpr = dpr || stage.dpr; aabb2.set(_viewport, 0, 0, w, hh); };
+
+  // Remove every node in one cold O(capacity) pass without reallocating: the
+  // arena resets its pool (advancing every generation, so every handle minted
+  // before clear() is invalid afterward) and drops the component count to 0.
+  // Geometries, materials, camera, frame arenas and capacity are all kept. The
+  // epoch bumps so caches (Motion dense index) invalidate. Allocates nothing.
+  stage.clear = () => {
+    arena.clear();
+    stage._topoDirty = true;
+    _structureEpoch = (_structureEpoch + 1) >>> 0;
+    return stage;
+  };
+
+  // Grow ALL maxNodes-sized lanes to hold `n` nodes. Cold, between frames,
+  // explicit. Returns false (a defined no-op) when n <= current capacity, true
+  // after a successful grow. Fails closed on a bad request: a non-integer or
+  // negative n is a caller bug, thrown with a did-you-mean hint rather than
+  // silently coerced. The arena grows the per-node SoA; the stage grows the
+  // frame/topo scratch lanes sized by maxNodes in lockstep.
+  stage.reserve = (n) => {
+    if (!Number.isInteger(n) || n < 0) {
+      throw new Error('lite-depth: stage.reserve(n) needs a non-negative integer node capacity, got ' +
+        (typeof n === 'number' ? n : typeof n) + ' -- did you mean reserve(' + (maxNodes * 2) + ')?');
+    }
+    if (n <= maxNodes) return false;
+    // arena.reserve grows the per-node SoA lanes (px..bias) in place; it throws
+    // (fail closed) if any component is caller-backed or detached -- do not mask
+    // that reason. It returns false only when n <= arena.capacity, which n>maxNodes
+    // rules out here since the arena capacity tracks maxNodes.
+    arena.reserve(n);
+    // Grow every stage-owned maxNodes-sized lane. new-then-copy: the live prefix
+    // [0, count) is preserved; the tail is fresh zero. Cold allocation is legal.
+    const nv = new Int32Array(n); nv.set(vertBase); vertBase = nv; stage._draw.vertBase = nv;
+    const nt = new Uint32Array(n); nt.set(topo); topo = nt;
+    const npd = new Int32Array(n); npd.set(parentDense); parentDense = npd;
+    const nr = new Uint8Array(n); nr.set(recomputed); recomputed = nr;
+    const nda = new Int32Array(n); nda.set(depthArr); depthArr = nda;
+    const ns = new Uint32Array(n); ns.set(stackArr); stackArr = ns;
+    const nlo = new Uint32Array(n); nlo.set(levelOff); levelOff = nlo;
+    maxNodes = n;
+    stage._topoDirty = true;
+    _structureEpoch = (_structureEpoch + 1) >>> 0;
+    return true;
+  };
 
   /* ── cold: lite-signal DI ── */
   stage.useSignals = (api) => { stage._signals = api; return stage; };
@@ -413,9 +472,29 @@ export function createStage(ctx, opts) {
 
   /* ── topo rebuild (cold, on structural change) ── */
   function rebuildTopo() {
-    const count = nodes.count, D = nodes.data, parentL = D.parent, sparse = nodes.sparse;
-    // resolve parent handles -> dense indices (valid until next structural change)
-    for (let d = 0; d < count; d++) { const ph = parentL[d]; parentDense[d] = ph === 0 ? -1 : sparse[ph & INDEX_MASK]; }
+    const count = nodes.count, D = nodes.data, parentL = D.parent;
+    const st = stage.stats;
+    st.nodesOrphaned = 0;
+    // resolve parent handles -> dense indices GENERATIONALLY (valid until the next
+    // structural change). has() validates liveness AND membership, so a despawned
+    // parent whose slot was reissued no longer resolves to the stranger now in that
+    // slot: it falls back to ROOT and is counted, fail-closed and visible. The
+    // handle layout stays opaque -- no hand decomposition.
+    for (let d = 0; d < count; d++) {
+      const ph = parentL[d];
+      if (ph === 0) { parentDense[d] = -1; }
+      else if (nodes.has(ph)) { parentDense[d] = nodes.idx(ph); }
+      else {
+        // dead/recycled parent -> ROOT. The parentage just changed, so mark the
+        // node dirty (same mechanism setParent uses): frame()'s transform pass
+        // only recomposes on F_DIRTY or a recomputed parent, so a child already
+        // warm-computed under the now-dead parent would otherwise stay pinned to
+        // its stale world matrix. Marking it dirty recomposes it as a root this
+        // frame; the existing topo-order propagation (recomputed[pd]===1) then
+        // re-dirties its subtree. Cold path, no allocation.
+        parentDense[d] = -1; st.nodesOrphaned++; D.flags[d] |= F_DIRTY;
+      }
+    }
     // memoized depth: each node's depth assigned exactly once -> O(n).
     for (let d = 0; d < count; d++) depthArr[d] = -1;
     let maxD = 0;
@@ -423,8 +502,17 @@ export function createStage(ctx, opts) {
       if (depthArr[d] >= 0) continue;
       let sp = 0, cur = d, guard = 0;
       while (cur >= 0 && depthArr[cur] < 0) {
-        stackArr[sp++] = cur; cur = parentDense[cur];
-        if (++guard > count) { cur = -1; break; }   // cycle guard: treat as root
+        stackArr[sp++] = cur;
+        const nx = parentDense[cur];
+        // A parent chain longer than `count` cannot be a tree -- it is a cycle.
+        // Fail closed: name both nodes in the loop rather than silently treating
+        // it as a root and truncating (or spinning forever).
+        if (++guard > count) {
+          throw new Error('lite-depth: parent cycle detected -- node index ' + cur +
+            ' and node index ' + nx + ' form a loop (a->b->...->a). setParent created ' +
+            'a cyclic hierarchy; break it before frame().');
+        }
+        cur = nx;
       }
       let base = cur < 0 ? -1 : depthArr[cur];
       while (sp > 0) { const n = stackArr[--sp]; base += 1; depthArr[n] = base; if (base > maxD) maxD = base; }
@@ -444,9 +532,11 @@ export function createStage(ctx, opts) {
     if (stage._topoDirty) rebuildTopo();
     const st = stage.stats;
     st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0;
-    // Observability hooks (always-zero for now; D3 populates overflow/invalid).
-    // Integer stores OUTSIDE both hot loops: nodesTotal is the live node count,
-    // the other two are 0 placeholders. No per-vertex/per-face body was touched.
+    // Observability hooks. Integer stores OUTSIDE both hot loops: nodesTotal is
+    // the live node count; facesOverflowed is reset here and now fires per NODE in
+    // the collect pass (the overflow door); nodesInvalid stays a 0 placeholder
+    // (D2). nodesOrphaned is owned by rebuildTopo (reset + counted there), so it is
+    // NOT touched here -- it must survive frames on which topo was not rebuilt.
     st.facesOverflowed = 0; st.nodesInvalid = 0; st.nodesTotal = count;
 
     // cache lane refs (monomorphic locals)
@@ -506,6 +596,11 @@ export function createStage(ctx, opts) {
       const cvz = V[8] * wcx + V[9] * wcy + V[10] * wcz + V[11];
       const rad = g.radius * Math.max(sx[d], sy[d], sz[d]);
       if (cvz - rad > -near || cvz + rad < -far) { st.nodesCulled++; continue; }
+
+      // overflow door (D-07): two integer compares per NODE, hoisted above both
+      // inner loops. If this node's verts or faces would run past the frame-arena
+      // budgets, skip it whole -- no partial/out-of-range write -- and count it.
+      if (vc + g.V > maxVerts || dc + g.drawSlots > maxDrawFaces) { st.facesOverflowed++; continue; }
 
       vertBase[d] = vc;
       const gv = g.verts, GV = g.V;
@@ -652,4 +747,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.2.0';
+export const version = '1.3.0';

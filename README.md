@@ -5,7 +5,7 @@
 > Z-bias / layer escape-hatch playground. Run it with `npx serve .` and open
 > `demo/demo.html`.
 >
-> **[DEPTH // MOTION](demo/motion.html)** *(v1.2.0)* — a clock-driven timeline
+> **[DEPTH // MOTION](demo/motion.html)** *(v1.3.0)* — a clock-driven timeline
 > scrubber: scrub, play, and pingpong a field of props animated with
 > keyframed position, quaternion slerp, and scale. Open `demo/motion.html`.
 
@@ -129,6 +129,26 @@ e.g. an OKLCH scale from [`@zakkster/lite-hueforge`](https://www.npmjs.com/packa
 All setters mark the node dirty; structural changes (add / remove / reparent)
 flag a cold topological rebuild before the next frame.
 
+A parent handle that has been removed (its slot recycled) is resolved
+generationally, not by hand: the orphaned child reparents to ROOT and bumps
+`stats.nodesOrphaned` rather than silently inheriting a stranger's world matrix.
+A parent cycle throws from the cold rebuild, naming both nodes.
+
+### Lifecycle (cold path)
+
+For scene reloads and capacity growth, without rebuilding the whole stage:
+
+```js
+stage.clear();            // remove all nodes in place; keep capacity, geometries,
+                          // materials, camera, frame arenas; 0 allocation.
+                          // every handle minted before clear() is now invalid.
+stage.reserve(8192);      // grow all node-capacity lanes; returns false when
+                          // n <= capacity, true after a grow; throws on a bad arg.
+stage.remainingNodes;     // free node slots (capacity - live count)
+stage.structureEpoch;     // Uint32, bumped by addNode/remove/setParent/clear --
+                          // the invalidation signal for any cached dense index.
+```
+
 ### Camera
 
 `createCamera(opts)` / `stage.camera` carry `{ theta, phi, radius, tx/ty/tz,
@@ -140,7 +160,10 @@ the composition hook for a 2D screen-space camera (shake, framing) over the 3D s
 ### `stage.frame(dt) → stats`
 
 Runs the pipeline and returns `{ facesDrawn, facesCulled, nodesCulled,
-drawCalls, tTransform, tProject, tSort, tPaint }`.
+drawCalls, tTransform, tProject, tSort, tPaint, facesOverflowed, nodesInvalid,
+nodesOrphaned, nodesTotal }`. `facesOverflowed` counts nodes the frame-arena
+overflow door skipped (size up `maxVerts` / `maxDrawFaces` when it is nonzero);
+`nodesOrphaned` counts dead-parent reparents; `nodesTotal` is the live count.
 
 ### lite-signal DI (cold path)
 
@@ -190,7 +213,7 @@ per shape per frame — structural to its design, not a tuning artifact.
 > performance bars are pinned on a 10-year-old MacBook Pro (primary) and
 > iPhone 11 / mid Android (secondary).
 
-## Motion — the animation layer (v1.2.0)
+## Motion — the animation layer (v1.3.0)
 
 `@zakkster/lite-depth/motion` is an optional subpath: a zero-GC keyframe mixer
 that drives node lanes over time. It's a **thin composer over the stack**, not a

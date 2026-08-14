@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth/motion — v1.2.0 "Motion" animation layer for lite-depth.
+ * @zakkster/lite-depth/motion — v1.3.0 "Motion" animation layer for lite-depth.
  *
  * A thin composer over the stack, not a re-implementation:
  *   - time base   = @zakkster/lite-clock   (deterministic advance(dt), simTime)
@@ -22,8 +22,6 @@
 import { KeyframePool } from '@zakkster/lite-keyframe';
 import * as ease from '@zakkster/lite-ease';
 import { FLAGS } from './Depth.js';
-
-const INDEX_MASK = 0xFFFFF;   // lite-arena low 20 bits = slot index
 
 /* clip loop modes */
 export const ONCE = 0, LOOP = 1, PINGPONG = 2;
@@ -91,6 +89,14 @@ export function createMixer(stage, opts) {
   const cLoop = new Uint8Array(maxClips);
   const cFlags = new Uint8Array(maxClips);
   const cMaxKeyT = new Float64Array(maxClips);   // for duration inference
+  // Dense node-index cache: clip id -> node's dense arena index, resolved
+  // GENERATIONALLY (nodes.has/idx) on the COLD path and read on the hot path. It
+  // is rebuilt when stage.structureEpoch has advanced since the last apply() (a
+  // node add/remove/reparent/clear reindexes the arena) or when a clip is added.
+  // Steady state (no structural change, no new clip) reads the cache with zero
+  // allocation and zero per-clip handle math. -1 marks a clip whose node is dead.
+  const cDense = new Int32Array(maxClips);
+  let cacheEpoch = -1;                             // -1 never equals a Uint32 epoch -> first apply() rebuilds
   let clipCount = 0;
 
   let simTime = 0;                                // standalone time base
@@ -101,6 +107,7 @@ export function createMixer(stage, opts) {
   function clip(nodeHandle) {
     if (clipCount >= maxClips) throw new Error('lite-motion: clip pool exhausted (' + maxClips + ')');
     const id = clipCount++;
+    cacheEpoch = -1;   // force a dense-cache rebuild next apply(): this clip's slot is unresolved
     cNode[id] = nodeHandle; cStart[id] = 0; cDur[id] = 0; cScale[id] = 1; cLoop[id] = ONCE; cFlags[id] = 0; cMaxKeyT[id] = 0;
     qCount[id] = 0; qCursor[id] = 0;
     // reset scalar rows for this clip
@@ -180,14 +187,38 @@ export function createMixer(stage, opts) {
      gets boxed as a HeapNumber across the non-inlined call boundary, but the
      same double stored straight into a Float64Array element does not. So we
      cache the lane refs and store in place, then set the dirty bit ourselves. */
-  const D = stage.nodes.data, sparse = stage.nodes.sparse;
-  const _px = D.px, _py = D.py, _pz = D.pz, _sx = D.sx, _sy = D.sy, _sz = D.sz;
-  const _qx = D.qx, _qy = D.qy, _qz = D.qz, _qw = D.qw, _bias = D.bias, _flags = D.flags;
+  const nodeSet = stage.nodes;
+  // Lane refs are HOISTED for the hot store, but stage.reserve() -> arena.reserve()
+  // reallocates every backing array, so a ref cached at mixer creation goes stale.
+  // reserve() bumps structureEpoch, so we re-read the lane refs on the SAME cold
+  // epoch-rebuild path as the dense-index cache -- `let`, refreshed in
+  // rebuildDense(). Steady state (no epoch change) never re-reads them: zero cost.
+  let _px, _py, _pz, _sx, _sy, _sz, _qx, _qy, _qz, _qw, _bias, _flags;
   const F_DIRTY = 1 << FLAGS.get('DIRTY');
   const F_NONUNIF = 1 << FLAGS.get('NON_UNIFORM_SCALE');
 
+  // Cold: refresh the hoisted lane refs (survives a reserve() realloc) and resolve
+  // every clip's node handle to a dense arena index once per epoch. Generational
+  // has()/idx(): a clip whose node was removed resolves to -1 and is skipped on the
+  // hot path rather than aliasing a recycled slot.
+  function rebuildDense() {
+    const D = nodeSet.data;
+    _px = D.px; _py = D.py; _pz = D.pz; _sx = D.sx; _sy = D.sy; _sz = D.sz;
+    _qx = D.qx; _qy = D.qy; _qz = D.qz; _qw = D.qw; _bias = D.bias; _flags = D.flags;
+    for (let id = 0; id < clipCount; id++) {
+      const h = cNode[id];
+      cDense[id] = nodeSet.has(h) ? nodeSet.idx(h) : -1;
+    }
+  }
+  rebuildDense();   // prime lane refs before the first apply() (cacheEpoch stays -1)
+
   function apply() {
     const T = now();
+    // Cold-path cache validation: rebuild only when the arena reindexed (epoch
+    // advanced) or a clip was added (cacheEpoch forced to -1). Steady state is a
+    // single Uint32 compare, no allocation.
+    const ep = stage.structureEpoch;
+    if (ep !== cacheEpoch) { rebuildDense(); cacheEpoch = ep; }
     for (let id = 0; id < clipCount; id++) {
       const flags = cFlags[id];
       const dur = cDur[id] || 1;
@@ -207,7 +238,8 @@ export function createMixer(stage, opts) {
       else if (loop === PINGPONG) { const p = elapsed % (2 * dur); lt = p < dur ? p : 2 * dur - p; }
       else { if (elapsed >= dur) { lt = dur; cFlags[id] = (cFlags[id] & ~PLAYING) | DONE; } else lt = elapsed; }
 
-      const d = sparse[cNode[id] & INDEX_MASK], base = id * ROWS_PER_CLIP;
+      const d = cDense[id]; if (d < 0) continue;   // node was removed -> skip (fail closed)
+      const base = id * ROWS_PER_CLIP;
       if (flags & HAS_POS) { _px[d] = pool.eval(base + R_POS, lt); _py[d] = pool.eval(base + R_POS + 1, lt); _pz[d] = pool.eval(base + R_POS + 2, lt); }
       if (flags & HAS_SCALE) {
         const vx = pool.eval(base + R_SCALE, lt), vy = pool.eval(base + R_SCALE + 1, lt), vz = pool.eval(base + R_SCALE + 2, lt);
@@ -234,4 +266,4 @@ export function createMixer(stage, opts) {
   return mixer;
 }
 
-export const version = '1.2.0';
+export const version = '1.3.0';

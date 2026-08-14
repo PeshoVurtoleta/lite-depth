@@ -4,6 +4,66 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-08-15
+
+Bounded safety and structural correctness (roadmap D1). The hot path gains exactly
+two integer compares per NODE (the overflow door); the per-vertex and per-face
+loop bodies are otherwise byte-identical to 1.2.0, and the zero-alloc gate holds
+at 0 B/op over 20000 frames. Every other change lands on the cold path (structural
+mutation / stage setup). Three latent silent-corruption bugs that had shipped
+since 1.1.0 are fixed here -- see Fixed.
+
+### Added
+
+- **Lifecycle API** -- `stage.clear()` (remove all nodes in place, keep capacity /
+  geometries / materials / frame arenas, allocate nothing; every handle minted
+  before it is invalid afterward), `stage.reserve(n)` (grow all node-capacity
+  lanes between frames; returns `false` when `n <= capacity`, throws on a
+  non-integer / negative `n`), and the `stage.remainingNodes` getter. A scene
+  reload no longer requires building a whole new stage.
+- **`stage.structureEpoch`** -- a monotonic `Uint32` (wraps) bumped by
+  `addNode` / `remove` / `setParent` / `clear`. The single invalidation signal
+  for any cached dense index; the `/motion` mixer's node-index cache now rides it.
+- **`stats.nodesOrphaned`** -- counts nodes whose parent handle was dead/recycled
+  this frame and were reparented to ROOT (see Fixed). Always present in the stats
+  literal.
+- **`geometry.*.drawSlots`** -- the draw-list entries a geometry emits per visible
+  node (`F` for fills, `1` for strokes); the overflow door gates on it so a stroke
+  (F=0, one draw entry) cannot slip a write past a full draw list.
+- `test/11-bounded-safety.test.js` -- 22 boundary cases covering the overflow
+  door (stroke / fill / vert budget), generational orphan reparenting (including
+  the warm steady-state path and subtree propagation), parent cycles,
+  `structureEpoch`, and `clear` / `reserve`.
+
+### Fixed
+
+- **Hand-decomposed handles, failing open (S1).** `rebuildTopo` resolved a parent
+  with `sparse[ph & INDEX_MASK]`, throwing away the generation -- the only thing
+  distinguishing a live parent from a despawned one whose slot has been reissued.
+  A child then silently inherited a stranger's world matrix. Parent resolution now
+  goes through the arena's generational `nodes.has(ph) ? nodes.idx(ph) : -1`; a
+  dead parent reparents to ROOT and increments `stats.nodesOrphaned`, and the
+  orphaned node is re-dirtied so `frame()` recomposes it at ROOT the same frame
+  (not left pinned to the stale transform composed under the dead parent). The
+  `INDEX_MASK` decomposition is deleted from both `Depth.js` and `Motion.js`;
+  `Motion.js` now resolves each clip's dense index through a `structureEpoch`-keyed
+  cache instead of a per-frame hand-decomposed lookup.
+- **Silent frame-arena overflow (S1).** `frame()` never checked the vertex or
+  draw-face cursor against `maxVerts` / `maxDrawFaces`; typed arrays discard
+  out-of-range writes, so an undersized stage dropped geometry with zero signal.
+  A two-compare-per-node overflow door now skips an over-budget node and
+  increments `stats.facesOverflowed` -- no out-of-range write, no partial face
+  referencing an unwritten vertex, and the read-only draw-list handles stay
+  consistent.
+- **Silent parent cycle (S2).** A parent cycle in `rebuildTopo` was treated as a
+  root and rendered with no signal. It now throws an `Error` naming both nodes in
+  the cycle -- fail closed on a caller bug rather than silently truncating.
+
+### Changed
+
+- **`Depth.d.ts`** -- declarations added for `clear` / `reserve` / `remainingNodes`
+  / `structureEpoch`, the four newer `stats` fields, and `Geometry.drawSlots`.
+
 ## [1.2.0] - 2026-08-12
 
 Publish-readiness and observability. No change to the hot path: the per-vertex
