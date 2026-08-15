@@ -57,7 +57,8 @@ export interface MaterialOptions {
   r?: number; g?: number; b?: number;
   /** Ambient floor 0–1 (shade never drops below this). Default 0.35. */
   ambient?: number;
-  /** Ramp resolution. Default 64. */
+  /** Ramp resolution. Default 64. Capped at 256: the per-frame shade lane is a
+   *  Uint8Array, so `steps > 256` throws at creation (fail closed, never wraps). */
   steps?: number;
   /** Stroke colour for outlined/polyline nodes. */
   stroke?: string | null;
@@ -101,8 +102,16 @@ export interface StageStats {
   tPaint: number;
   /** Nodes skipped by the frame-arena overflow door (vert or draw-face budget exceeded). */
   facesOverflowed: number;
-  /** Reserved always-zero hook for the NaN/invalid-node reject (wired in a later milestone). */
+  /** Nodes rejected by the fail-closed collect door: a non-finite (NaN/Infinity)
+   *  pose lane, world centroid, radius or bias. The whole node is skipped (never
+   *  a partial/laundered draw entry) and counted here. */
   nodesInvalid: number;
+  /** Drawn nodes with a non-uniform LOCAL scale (the `NON_UNIFORM_SCALE` flag)
+   *  this frame -- the D-04 inverse-transpose feature. Note: a locally-uniform
+   *  child UNDER a non-uniformly-scaled ancestor is also lit through the
+   *  inverse-transpose (its composed world basis is not a similarity), but is not
+   *  itself counted here. */
+  nodesNonUniform: number;
   /** Nodes whose parent handle was dead/recycled this frame and were reparented to ROOT. */
   nodesOrphaned: number;
   /** Live node count this frame. */

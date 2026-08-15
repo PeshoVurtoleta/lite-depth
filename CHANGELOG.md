@@ -4,6 +4,96 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-08-15
+
+Shading correctness (roadmap D2). One bug in four costumes: the shading path read
+different inputs than the geometry path. All four are fixed together; the per-face
+**paint** body ends up strictly SMALLER than 1.3.0 (the whole per-face `quatRotate`
++ dot + clamp + float-to-int is gone), the zero-alloc gate holds at 0 B/op over
+20000 frames, and the extra per-node cost lands in collect (once per node), never
+per face.
+
+> **VISIBLE RENDERING CHANGE.** Every hierarchical scene re-lights. Before 1.4.0 a
+> face was lit by rotating its normal with the node's LOCAL quaternion while the
+> face itself was drawn from the WORLD matrix, so any child of a rotated or scaled
+> parent was mis-lit (ambient made it read as "flat", not "wrong"). From 1.4.0 the
+> normal is transformed by the node's world matrix, so shading matches the drawn
+> geometry. Renders will differ from 1.3.0 wherever a lit node has a rotated/scaled
+> ancestor or a non-uniform scale, and wherever a `fill: false` material was used
+> (it no longer fills). This is a correctness fix, not a regression.
+
+### Fixed
+
+- **Flat shading ignored parent rotation (S1, D-03).** `paint()` rotated the face
+  normal by the node's LOCAL quaternion lanes while the geometry was drawn from the
+  WORLD matrix, so a child of a rotated parent was lit as if the parent were not
+  rotated. Shade is now derived from the world matrix: the directional light is
+  back-rotated into each geometry's local frame ONCE per node (uniform case: through
+  the world upper-3x3 with a per-node scale renormalize), and each face's shade is a
+  single dot with its precomputed local normal, baked into a per-draw `Uint8Array`
+  shade lane during collect. `paint()` reads that lane (`material.lut[shade]`).
+- **`NON_UNIFORM_SCALE` computed but never consumed (S2, D-04).** `setScale`
+  maintained `F_NONUNIF` and nothing read it, so a non-uniformly scaled node was lit
+  with a normal that no longer pointed where the surface did. Non-uniform nodes now
+  light through the inverse-transpose (the normal matrix = adjugate of the world
+  upper-3x3 over its determinant), built once per node in collect; each face then
+  transforms its local normal, normalizes, and dots with the light. The uniform
+  majority keeps the sqrt-free back-rotated-light fast path. The path is selected by
+  a per-node **world** non-uniform bit propagated down the hierarchy in topo order
+  (own non-uniform local scale OR any non-uniform ancestor -- rotation is a
+  similarity and does not taint), so an inherited non-uniform scale (a
+  locally-uniform child under a non-uniformly-scaled parent) is shaded correctly,
+  not just an own-node one. `stats.nodesNonUniform` counts drawn nodes with a
+  non-uniform LOCAL scale (the flag); inherited-only descendants take the
+  inverse-transpose too but are not counted.
+- **`material.fill` documented but never read (S2, D-05).** `material({ fill: false })`
+  still filled. `paint()` now honours `fill` (`fill: false` emits no `fill()`) and
+  `stroke` (the face outline is stroked in the same one-`beginPath`-per-style-run
+  batch). `fill: true` / `stroke: null` output is byte-identical to 1.3.0.
+- **NaN laundered to the far plane (S1, D-06).** A NaN pose lane produced NaN screen
+  coords whose face-centroid `z` reached `quantize`, where `(NaN * DEPTH_MAX) | 0 === 0`
+  mapped it to the far plane (painted first, forever) with no counter. Two fixes: a
+  fail-closed collect door rejects any node with a non-finite pose lane, world
+  centroid, radius or bias -- once per NODE, never per face -- and bumps
+  `stats.nodesInvalid`; and `quantize` now uses ordered compares only, so an
+  unordered (NaN) result is a REJECT to `DEPTH_MAX`, never the far plane. Finite `z`
+  is byte-identical to 1.3.0.
+
+### Added
+
+- **`stats.nodesNonUniform`** -- drawn nodes with a non-uniform local scale this
+  frame (the `NON_UNIFORM_SCALE` inverse-transpose feature). Present in the stats
+  literal and reset each frame.
+- **Material step cap (fail closed).** `material({ steps })` and
+  `materialFromRamp(ramp)` throw when the ramp exceeds **256** steps -- the per-frame
+  shade lane is a `Uint8Array`, so a longer ramp would wrap its index to step 0.
+  Rejected at creation with a did-you-mean hint (`material()` / `materialFromRamp()`
+  in `Depth.js`) rather than mis-shading every frame. `stats.nodesInvalid` is no
+  longer an always-zero placeholder; it now counts the D-06 rejects.
+
+### Decisions (measured)
+
+- **D2-a -- bake the shade in collect (paint body must shrink).** The per-face PAINT
+  body dropped from a full `quatRotate` (~18 mul / 12 add-sub / a call / 3 scratch
+  writes) + a 3-mul-2-add dot + a clamp + a `mul,sub,|0` LUT-index build to a single
+  `shadeL[e]` typed-array read plus the `lut[...]` lookup (the batch bookkeeping adds
+  only two field reads and two scalar compares, off the critical path for default
+  materials). Net per-face delta: roughly **-22 multiplies, -14 add/subs, -1 call,
+  -3 scratch writes**, +2 reads / +2 compares -- unambiguously net-negative, meeting
+  the acceptance bar. The displaced work moved to collect as a per-face 3-mul dot +
+  `mul,|0` (far cheaper than a `quatRotate`) plus a per-NODE back-rotation, so the
+  expensive transform is amortized across all of a node's faces.
+- **D2-b -- inverse-transpose only where the WORLD basis is non-uniform.** The
+  adjugate/inverse-transpose branch is gated by a per-node `worldNonUnif` bit
+  (own non-uniform local scale OR any non-uniform ancestor), propagated in topo
+  order alongside the world matrix in a pre-allocated `Uint8Array(maxNodes)` lane --
+  O(1) per node, 0 B/op, no per-face similarity test. Every fully-uniform node takes
+  the cheaper sqrt-free back-rotation. `stats.nodesNonUniform` counts the own-flagged
+  subset: `setScale(h, 3, 1, 1)` on one node yields `nodesNonUniform === 1`, 0 for a
+  uniform-only scene; a locally-uniform child under that parent is shaded through the
+  inverse-transpose (matching a gl-matrix `normalFromMat4` world-matrix oracle,
+  exact integer LUT index over a 500-pose fuzz) without being counted.
+
 ## [1.3.0] - 2026-08-15
 
 Bounded safety and structural correctness (roadmap D1). The hot path gains exactly

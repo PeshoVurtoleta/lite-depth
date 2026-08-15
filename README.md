@@ -37,7 +37,7 @@ The render loop (transform → project → cull → radix sort → paint) produc
 - **Arena-backed nodes.** Built on [`@zakkster/lite-arena`](https://www.npmjs.com/package/@zakkster/lite-arena): generational handles (a stale handle after `remove` invalidates instead of aliasing a recycled slot), SoA sparse-set storage, swap-and-pop compaction that keeps the transform pass dense and cache-warm.
 - **One packed sort key, three jobs.** `key = (layer << 26) | quantize26(viewZ + depthBias)`. A per-node `depthBias` is the manual escape hatch for popping on interpenetrating meshes; a `layer` lane forces ordering outright (HUD props always over scenery). Same radix passes, zero extra cost.
 - **Six primitives + custom meshes.** Box, plane, sphere, cylinder, cone, polyline, and `custom(verts, faces)` — quads and n-gons are first-class (a box is 6 quad faces, not 12 tris). Face normals precomputed with Newell's method.
-- **Flat shading without string churn.** Each material pre-bakes a K-step hex ramp at creation; per-frame shading is a single LUT index (`material.lut[(ndl * (K-1)) | 0]`) — no `rgb(...)` built in the paint loop.
+- **Flat shading without string churn.** Each material pre-bakes a K-step hex ramp at creation (K capped at 256 — the shade lane is a `Uint8Array`, so a longer ramp throws rather than wrapping). Shading is lit from the node's **world** matrix (the same transform the face is drawn from, so a child of a rotated/scaled parent is lit correctly), computed once per node during collect and baked into a per-draw shade lane; the paint loop is a single `material.lut[shade]` read — no per-face normal math, no `rgb(...)` built in the loop.
 - **Hybrid precision.** `Float32Array` for static geometry stores (read-only at project time, memory-dense); `Float64Array` for frame arenas and math registers, so screen coordinates never silently up-cast before `moveTo`/`lineTo`.
 - **Real runtime dependencies.** [`lite-arena`](https://www.npmjs.com/package/@zakkster/lite-arena) · [`lite-fastbit32`](https://www.npmjs.com/package/@zakkster/lite-fastbit32) (flag namespace) · [`lite-aabb`](https://www.npmjs.com/package/@zakkster/lite-aabb) (per-face viewport cull). Optional cold-path peers: `lite-signal` (DI bindings), `lite-raf`, `lite-clock`, `lite-sprite-cache`.
 
@@ -120,6 +120,12 @@ convex index loops (quads and n-gons welcome).
 `material({ r, g, b, ambient, steps, stroke, lineWidth, fill })` bakes a K-step
 hex ramp at creation. `materialFromRamp(hexRamp, opts)` takes a ready-made ramp —
 e.g. an OKLCH scale from [`@zakkster/lite-hueforge`](https://www.npmjs.com/package/@zakkster/lite-hueforge).
+`steps` (and a ramp length) is capped at **256**: the per-frame shade lane is a
+`Uint8Array`, so an over-long ramp throws at creation (fail closed) rather than
+silently wrapping the index to step 0. `fill: false` now emits **no** `fill()`
+(before v1.4.0 it filled anyway); a `stroke` colour outlines the face in the same
+style-run batch, so `fill: false` + `stroke` is a wireframe and `fill: true` +
+`stroke` is fill-then-outline.
 
 ### Nodes
 
@@ -161,9 +167,15 @@ the composition hook for a 2D screen-space camera (shake, framing) over the 3D s
 
 Runs the pipeline and returns `{ facesDrawn, facesCulled, nodesCulled,
 drawCalls, tTransform, tProject, tSort, tPaint, facesOverflowed, nodesInvalid,
-nodesOrphaned, nodesTotal }`. `facesOverflowed` counts nodes the frame-arena
-overflow door skipped (size up `maxVerts` / `maxDrawFaces` when it is nonzero);
-`nodesOrphaned` counts dead-parent reparents; `nodesTotal` is the live count.
+nodesNonUniform, nodesOrphaned, nodesTotal }`. `facesOverflowed` counts nodes the
+frame-arena overflow door skipped (size up `maxVerts` / `maxDrawFaces` when it is
+nonzero); `nodesInvalid` counts nodes the fail-closed collect door rejected for a
+non-finite (NaN/Infinity) pose lane, centroid, radius or bias — the whole node is
+skipped, never laundered into a far-plane draw; `nodesNonUniform` counts drawn
+nodes with a non-uniform **local** scale (the `NON_UNIFORM_SCALE` inverse-transpose
+feature — a locally-uniform child under a non-uniform ancestor is still lit through
+the inverse-transpose, but is not itself counted); `nodesOrphaned` counts
+dead-parent reparents; `nodesTotal` is the live count.
 
 ### lite-signal DI (cold path)
 

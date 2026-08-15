@@ -1,8 +1,8 @@
 /**
- * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.4.0 "Painter")
+ * @zakkster/lite-depth -- Zero-GC Canvas2D software-projected 3D (v1.3.0 "Painter")
  *
- * Zdog's niche — flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
- * canvas — but arena-backed and allocation-free on the frame loop. Zdog allocates
+ * Zdog's niche -- flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
+ * canvas -- but arena-backed and allocation-free on the frame loop. Zdog allocates
  * a Vector per point per frame; lite-depth allocates zero bytes per frame.
  *
  * Pipeline per stage.frame(dt):
@@ -21,7 +21,7 @@ import { Arena } from '@zakkster/lite-arena';
 import { BitMapper } from '@zakkster/lite-fastbit32';
 import { aabb2 } from '@zakkster/lite-aabb';
 
-/* ─────────────────────────────── constants ─────────────────────────────── */
+/* ------------------------------- constants ------------------------------- */
 
 export const TAU = Math.PI * 2;
 const DEPTH_BITS = 26;               // 26-bit quantized depth key
@@ -40,13 +40,13 @@ const F_DOUBLE = 1 << FLAGS.get('DOUBLE_SIDED');
 const F_STROKE = 1 << FLAGS.get('STROKE');
 const F_NONUNIF = 1 << FLAGS.get('NON_UNIFORM_SCALE');
 
-/* ───────────────────────── math kernels (out-param) ─────────────────────── */
+/* ------------------------- math kernels (out-param) ----------------------- */
 // No Vec3/Mat4 classes. Everything writes into caller buffers; module-level
 // scratch registers below. Matrices are affine 3x4, row-major: [m0..m11].
 
 const _LOC = new Float64Array(12);   // scratch: local matrix
+const _NRM = new Float64Array(3);    // scratch: rotated normal
 const _CEN = new Float64Array(3);    // scratch: view-space node centre
-const _NM = new Float64Array(9);     // scratch: per-node normal matrix (row-major) for the non-uniform shade path
 
 // Compose a local 3x4 from translation/quaternion/scale into out.
 function composeTRS(out, tx, ty, tz, qx, qy, qz, qw, sx, sy, sz) {
@@ -91,7 +91,7 @@ function quatRotate(out, qx, qy, qz, qw, vx, vy, vz) {
 
 export const mathKernels = { composeTRS, mulAffine, quatRotate };
 
-/* ─────────────────────────────── geometry ──────────────────────────────── */
+/* ------------------------------- geometry -------------------------------- */
 // A geometry is shared and instanced per node. Vertices are Float32 (read-only
 // on the hot path; memory density). Faces are convex polygons (quads/n-gons
 // first-class). faceNormal is precomputed local-space (Float32).
@@ -207,7 +207,7 @@ export const geometry = {
   },
 };
 
-/* ─────────────────────────────── material ──────────────────────────────── */
+/* ------------------------------- material -------------------------------- */
 // fillStyle strings allocate when built per frame. Every material pre-bakes a
 // K-step hex ramp at creation; per-frame shading is a single LUT index.
 
@@ -215,11 +215,6 @@ function hex2(n) { n = n < 0 ? 0 : n > 255 ? 255 : n | 0; return (n < 16 ? '0' :
 
 export function material(opts) {
   const K = opts.steps || 64;
-  // The per-frame shade lane (shadeL) is a Uint8Array: the baked LUT index must
-  // fit in 0..255, so K is capped at 256 (index range 0..K-1 = 0..255). A longer
-  // ramp would silently wrap the index to 0 (the darkest step) on the hot path --
-  // fail closed here, at creation, rather than mis-shade every frame.
-  if (K > 256) throw new Error('lite-depth: material steps=' + K + ' exceeds the 256-step shade-lane cap (shadeL is Uint8) -- did you mean steps: 256?');
   const r = opts.r ?? 90, g = opts.g ?? 200, b = opts.b ?? 120;
   const ambient = opts.ambient ?? 0.35;
   const lut = new Array(K);
@@ -237,15 +232,11 @@ export function material(opts) {
 
 // Optional lite-hueforge / lite-color-engine ramp bridge (cold path).
 export function materialFromRamp(hexRamp, opts) {
-  const K = hexRamp.length;
-  // Same Uint8 shade-lane cap as material(): a ramp longer than 256 stops cannot
-  // be indexed by the shade lane. Fail closed rather than silently truncate.
-  if (K > 256) throw new Error('lite-depth: materialFromRamp ramp length ' + K + ' exceeds the 256-step shade-lane cap (shadeL is Uint8) -- trim the ramp to <=256 stops.');
-  const m = { lut: hexRamp.slice(), K, stroke: (opts && opts.stroke) || null, lineWidth: (opts && opts.lineWidth) || 2, fill: !(opts && opts.fill === false) };
+  const m = { lut: hexRamp.slice(), K: hexRamp.length, stroke: (opts && opts.stroke) || null, lineWidth: (opts && opts.lineWidth) || 2, fill: !(opts && opts.fill === false) };
   return m;
 }
 
-/* ─────────────────────────────── camera ────────────────────────────────── */
+/* ------------------------------- camera ---------------------------------- */
 
 export function createCamera(opts) {
   const o = opts || {};
@@ -283,7 +274,7 @@ export function updateCamera(cam) {
   V[8] = zx; V[9] = zy; V[10] = zz; V[11] = -(zx * ex + zy * ey + zz * ez);
 }
 
-/* ─────────────────────────────── stage ─────────────────────────────────── */
+/* ------------------------------- stage ----------------------------------- */
 
 export function createStage(ctx, opts) {
   const o = opts || {};
@@ -320,7 +311,6 @@ export function createStage(ctx, opts) {
   const drawKey = new Uint32Array(maxDrawFaces);
   const drawNode = new Uint32Array(maxDrawFaces); // dense node index
   const drawFace = new Uint32Array(maxDrawFaces);
-  const shadeL = new Uint8Array(maxDrawFaces);    // per-draw-entry baked LUT index (shade computed in collect)
 
   // radix scratch (LSD, 4x8-bit)
   const orderA = new Uint32Array(maxDrawFaces);
@@ -347,11 +337,6 @@ export function createStage(ctx, opts) {
   let depthArr = new Int32Array(maxNodes);
   let stackArr = new Uint32Array(maxNodes);
   let levelOff = new Uint32Array(maxNodes);
-  // Per-node WORLD non-uniform bit, propagated in topo order in the transform
-  // pass: 1 iff this node's composed world upper-3x3 is NOT a similarity (own
-  // local non-uniform scale OR any non-uniform ancestor). F_NONUNIF is a static
-  // LOCAL flag; this lane is the dynamic world property the shade branch gates on.
-  let worldNonUnif = new Uint8Array(maxNodes);
 
   // aabb scratch (lite-aabb)
   const _box = aabb2.create();
@@ -363,7 +348,7 @@ export function createStage(ctx, opts) {
     light: new Float64Array([0.4, 0.8, 0.5]),   // normalized below
     view2d: null,                                // optional external 2D transform (lite-camera)
     _signals: null,
-    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0 },
+    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesOrphaned: 0, nodesTotal: 0 },
     _topoDirty: true,
     // read-only views of the current draw ordering (observation handles only).
     // Accessors declared in the literal so they are part of the stage's initial
@@ -382,7 +367,7 @@ export function createStage(ctx, opts) {
   aabb2.set(_viewport, 0, 0, stage.width, stage.height);
   updateCamera(stage.camera);
 
-  /* ── cold node API ── */
+  /* -- cold node API -- */
   stage.geometry = (g) => { geometries.push(g); return geometries.length - 1; };
   stage.material = (m) => { materials.push(m); return materials.length - 1; };
 
@@ -467,14 +452,13 @@ export function createStage(ctx, opts) {
     const nda = new Int32Array(n); nda.set(depthArr); depthArr = nda;
     const ns = new Uint32Array(n); ns.set(stackArr); stackArr = ns;
     const nlo = new Uint32Array(n); nlo.set(levelOff); levelOff = nlo;
-    const nwn = new Uint8Array(n); nwn.set(worldNonUnif); worldNonUnif = nwn;
     maxNodes = n;
     stage._topoDirty = true;
     _structureEpoch = (_structureEpoch + 1) >>> 0;
     return true;
   };
 
-  /* ── cold: lite-signal DI ── */
+  /* -- cold: lite-signal DI -- */
   stage.useSignals = (api) => { stage._signals = api; return stage; };
   stage.bind = (h, channel, get) => {
     if (!stage._signals) throw new Error('lite-depth: call useSignals({ effect }) before bind()');
@@ -486,7 +470,7 @@ export function createStage(ctx, opts) {
     stage._signals.effect(() => setter(get()));   // cold effect; writes lanes + marks dirty
   };
 
-  /* ── topo rebuild (cold, on structural change) ── */
+  /* -- topo rebuild (cold, on structural change) -- */
   function rebuildTopo() {
     const count = nodes.count, D = nodes.data, parentL = D.parent;
     const st = stage.stats;
@@ -541,7 +525,7 @@ export function createStage(ctx, opts) {
     stage._topoDirty = false;
   }
 
-  /* ── hot: frame ── */
+  /* -- hot: frame -- */
   const clock = (typeof performance !== 'undefined' && performance.now) ? performance : Date;
   stage.frame = (dt) => {
     const D = nodes.data, count = nodes.count;
@@ -549,19 +533,16 @@ export function createStage(ctx, opts) {
     const st = stage.stats;
     st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0;
     // Observability hooks. Integer stores OUTSIDE both hot loops: nodesTotal is
-    // the live node count; facesOverflowed is reset here and fires per NODE in the
-    // collect pass (the overflow door); nodesInvalid is reset here and now fires
-    // per NODE in the collect fail-closed door (a NaN pose lane -> whole-node
-    // reject); nodesNonUniform is reset here and fires per FLAGGED node when the
-    // inverse-transpose shade path is taken. nodesOrphaned is owned by rebuildTopo
-    // (reset + counted there), so it is NOT touched here -- it must survive frames
-    // on which topo was not rebuilt.
-    st.facesOverflowed = 0; st.nodesInvalid = 0; st.nodesNonUniform = 0; st.nodesTotal = count;
+    // the live node count; facesOverflowed is reset here and now fires per NODE in
+    // the collect pass (the overflow door); nodesInvalid stays a 0 placeholder
+    // (D2). nodesOrphaned is owned by rebuildTopo (reset + counted there), so it is
+    // NOT touched here -- it must survive frames on which topo was not rebuilt.
+    st.facesOverflowed = 0; st.nodesInvalid = 0; st.nodesTotal = count;
 
     // cache lane refs (monomorphic locals)
     const px = D.px, py = D.py, pz = D.pz, qx = D.qx, qy = D.qy, qz = D.qz, qw = D.qw, sx = D.sx, sy = D.sy, sz = D.sz;
     const m0 = D.m0, m1 = D.m1, m2 = D.m2, m3 = D.m3, m4 = D.m4, m5 = D.m5, m6 = D.m6, m7 = D.m7, m8 = D.m8, m9 = D.m9, m10 = D.m10, m11 = D.m11;
-    const flags = D.flags, geomL = D.geom, matL = D.mat, layerL = D.layer, biasL = D.bias;
+    const flags = D.flags, geomL = D.geom, layerL = D.layer, biasL = D.bias;
 
     /* transform: recompute world 3x4 for dirty subtrees (topo order) */
     let t = clock.now();
@@ -590,11 +571,6 @@ export function createStage(ctx, opts) {
         m10[d] = A8 * _LOC[2] + A9 * _LOC[6] + A10 * _LOC[10];
         m11[d] = A8 * _LOC[3] + A9 * _LOC[7] + A10 * _LOC[11] + A11;
       }
-      // Propagate the WORLD non-uniform bit in topo order (parent already done):
-      // own local F_NONUNIF taints this node, and ANY non-uniform ancestor taints
-      // it too (the composed basis is no longer a similarity). Rotation is a
-      // similarity, so a rotated-only ancestor does NOT taint. O(1), 0 alloc.
-      worldNonUnif[d] = (((flags[d] & F_NONUNIF) !== 0) ? 1 : 0) | (pd >= 0 ? worldNonUnif[pd] : 0);
       flags[d] &= ~F_DIRTY; recomputed[d] = 1;
     }
     st.tTransform = clock.now() - t;
@@ -608,10 +584,6 @@ export function createStage(ctx, opts) {
     const focal = ortho ? 0 : (0.5 * Math.min(stage.width, stage.height)) / Math.tan(cam.fov * 0.5);
     const orthoK = (Math.min(stage.width, stage.height) * 0.5) / cam.orthoScale;
     const zSpan = (far - near) || 1;         // positive span; maps viewZ [-far,-near] -> [0, DEPTH_MAX]
-    // directional light, hoisted once above the node loop. Shade is now baked into
-    // the shadeL lane in this pass (per node: back-rotate the light through the
-    // WORLD upper-3x3; per face: one dot). paint() no longer touches the light.
-    const light = stage.light, lgx = light[0], lgy = light[1], lgz = light[2];
     let vc = 0, dc = 0;
 
     for (let i = 0; i < count; i++) {
@@ -623,15 +595,6 @@ export function createStage(ctx, opts) {
       const wcx = m3[d], wcy = m7[d], wcz = m11[d];
       const cvz = V[8] * wcx + V[9] * wcy + V[10] * wcz + V[11];
       const rad = g.radius * Math.max(sx[d], sy[d], sz[d]);
-      const bias = biasL[d];
-      // fail-closed node door (D-06): a NaN/Infinity in any pose lane laundered
-      // this far poisons the projection and (via quantize) the sort key. ONE
-      // finiteness gate per NODE -- never per face -- rejects the whole node,
-      // counts it, and moves on. NaN is a REJECT, not a silent far-plane paint.
-      if (!(Number.isFinite(wcx) && Number.isFinite(wcy) && Number.isFinite(wcz) &&
-            Number.isFinite(cvz) && Number.isFinite(rad) && Number.isFinite(bias))) {
-        st.nodesInvalid++; continue;
-      }
       if (cvz - rad > -near || cvz + rad < -far) { st.nodesCulled++; continue; }
 
       // overflow door (D-07): two integer compares per NODE, hoisted above both
@@ -659,55 +622,13 @@ export function createStage(ctx, opts) {
 
       if ((flags[d] & F_STROKE) !== 0) {
         // one draw entry for the whole polyline at its centre depth
-        drawKey[dc] = packKey(layerL[d], quantize(cvz + bias, near, far, zSpan));
+        drawKey[dc] = packKey(layerL[d], quantize(cvz + biasL[d], near, far, zSpan));
         drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; dc++;
         continue;
       }
 
-      // Per-node shade setup (D-03/D-04), hoisted ABOVE the face loop and computed
-      // ONCE per node. Shade = clamp(dot(normalize(worldNormal), light), 0, 1),
-      // where worldNormal transforms the local face normal by the node's WORLD
-      // basis -- the same transform the geometry is drawn from. Two per-node paths,
-      // selected by the PROPAGATED world non-uniform bit (own local scale OR any
-      // non-uniform ancestor -- an inherited non-uniform basis is not a similarity
-      // either), NOT the static local F_NONUNIF:
-      //   - Uniform (common, tainted === 0): W = s*R is a similarity, so
-      //     |W*n| = s is CONSTANT across faces. Fold it once: back-rotate the light
-      //     Lb = (W^T * light) / s, and each face is a single sqrt-free dot
-      //     dot(n, Lb) == dot(normalize(W*n), light).
-      //   - Non-uniform (tainted !== 0, D-04): |N*n| VARIES per face, so it cannot
-      //     be folded out. Build the normal matrix N = cofactor(W)/det (row-major,
-      //     the same inverse-transpose gl-matrix's normalFromMat4 builds) ONCE into
-      //     _NM here; each face then does N*n, normalize, dot -- the per-face sqrt
-      //     is paid only by tainted nodes, never by the uniform majority.
-      const matK1 = materials[matL[d]].K - 1;
-      const tainted = worldNonUnif[d];   // branch selector: own OR inherited non-uniform
-      let Lbx = 0, Lby = 0, Lbz = 0;
-      if (tainted !== 0) {
-        // Counter tracks own LOCAL non-uniform nodes (the D-04 feature / F_NONUNIF
-        // flag), NOT inherited taint: a locally-uniform child under a non-uniform
-        // parent is shaded via the inverse-transpose (correct) but is not itself a
-        // "non-uniform node". own-flag set implies tainted, so this is a subset.
-        if ((flags[d] & F_NONUNIF) !== 0) st.nodesNonUniform++;
-        const C00 = M5 * M10 - M6 * M9, C01 = -(M4 * M10 - M6 * M8), C02 = M4 * M9 - M5 * M8;
-        const C10 = -(M1 * M10 - M2 * M9), C11 = M0 * M10 - M2 * M8, C12 = -(M0 * M9 - M1 * M8);
-        const C20 = M1 * M6 - M2 * M5, C21 = -(M0 * M6 - M2 * M4), C22 = M0 * M5 - M1 * M4;
-        const det = M0 * C00 + M1 * C01 + M2 * C02;
-        const invDet = det !== 0 ? 1 / det : 0;   // singular upper-3x3 -> zero normal -> ambient floor
-        // N = cofactor / det (NOT transposed): N*n gives the world normal direction.
-        _NM[0] = C00 * invDet; _NM[1] = C01 * invDet; _NM[2] = C02 * invDet;
-        _NM[3] = C10 * invDet; _NM[4] = C11 * invDet; _NM[5] = C12 * invDet;
-        _NM[6] = C20 * invDet; _NM[7] = C21 * invDet; _NM[8] = C22 * invDet;
-      } else {
-        const s2 = M0 * M0 + M4 * M4 + M8 * M8;
-        const invS = s2 > 0 ? 1 / Math.sqrt(s2) : 1;
-        Lbx = (M0 * lgx + M4 * lgy + M8 * lgz) * invS;
-        Lby = (M1 * lgx + M5 * lgy + M9 * lgz) * invS;
-        Lbz = (M2 * lgx + M6 * lgy + M10 * lgz) * invS;
-      }
-
       // faces
-      const base = vertBase[d], off = g.faceVertOffset, fv = g.faceVerts, F = g.F, fn = g.faceNormal;
+      const base = vertBase[d], off = g.faceVertOffset, fv = g.faceVerts, F = g.F;
       for (let fi = 0; fi < F; fi++) {
         const o0 = off[fi], o1 = off[fi + 1], n = o1 - o0;
         // near cull: any vertex in front of near plane
@@ -733,29 +654,9 @@ export function createStage(ctx, opts) {
         // (front) faces read as negative signed area. Keep those; cull the rest.
         const area = (bx - ax) * (cy2 - ay) - (cx2 - ax) * (by - ay);
         if (area >= 0 && (flags[d] & F_DOUBLE) === 0) { st.facesCulled++; continue; }
-        const cz = czSum / n + bias;
+        const cz = czSum / n + biasL[d];
         drawKey[dc] = packKey(layerL[d], quantize(cz, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = fi;
-        // bake the shade into the draw lane. Uniform: one sqrt-free dot with the
-        // back-rotated light (which already carries the world transform). Tainted:
-        // transform the local normal by the per-node normal matrix, normalize, and
-        // dot with the light -- the exact normalized inverse-transpose. The branch
-        // is per-node-constant (predictable); the sqrt lands only on tainted nodes.
-        const nx = fn[fi * 3], ny = fn[fi * 3 + 1], nz = fn[fi * 3 + 2];
-        let ndl;
-        if (tainted !== 0) {
-          const wx = _NM[0] * nx + _NM[1] * ny + _NM[2] * nz;
-          const wy = _NM[3] * nx + _NM[4] * ny + _NM[5] * nz;
-          const wz = _NM[6] * nx + _NM[7] * ny + _NM[8] * nz;
-          const ln2 = wx * wx + wy * wy + wz * wz;
-          if (ln2 > 0) { const invL = 1 / Math.sqrt(ln2); ndl = (wx * lgx + wy * lgy + wz * lgz) * invL; }
-          else ndl = 0;
-        } else {
-          ndl = nx * Lbx + ny * Lby + nz * Lbz;
-        }
-        if (ndl < 0) ndl = 0; else if (ndl > 1) ndl = 1;
-        shadeL[dc] = (ndl * matK1) | 0;
-        dc++;
+        drawNode[dc] = d; drawFace[dc] = fi; dc++;
       }
     }
     st.tProject = clock.now() - t;
@@ -790,34 +691,22 @@ export function createStage(ctx, opts) {
     // (painted first) and the near plane -> DEPTH_MAX (painted last, on top).
     // zSpan = far - near > 0, so t = (z + far) / zSpan rises monotonically as the
     // face approaches the camera.
-    const t = (z + far) / zSpan;
-    // ORDERED compares only. A NaN t is unordered and fails all three, falling to
-    // the final return -- so NaN can NEVER launder into 0 (the far plane, painted
-    // first, forever), the D-06 bug. It rejects to DEPTH_MAX (loud, on top) instead.
-    // Finite z is byte-identical to v1.3.0: t<=0 -> 0, t>=1 -> DEPTH_MAX, else scaled.
-    if (t <= 0) return 0;
-    if (t >= 1) return DEPTH_MAX;
-    if (t > 0) return (t * DEPTH_MAX) | 0;
-    return DEPTH_MAX;
+    let t = (z + far) / zSpan;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return (t * DEPTH_MAX) | 0;
   }
 
   function paint(order, dc) {
     const c = ctx, D = nodes.data;
-    const geomL = D.geom, matL = D.mat;
+    const geomL = D.geom, matL = D.mat, qxL = D.qx, qyL = D.qy, qzL = D.qz, qwL = D.qw;
     const st = stage.stats;
     // reset transform + clear
     if (stage.view2d) { const t2 = stage.view2d; c.setTransform(t2[0], t2[1], t2[2], t2[3], t2[4], t2[5]); }
     else c.setTransform(stage.dpr, 0, 0, stage.dpr, 0, 0);
     c.clearRect(0, 0, stage.width, stage.height);
 
-    // Style-run batching: one beginPath per (fillStyle, fill, stroke) run, flushed
-    // when any of those three change. curFill/curStroke are the CURRENT run's
-    // material behaviour so the flush honours material.fill (D-05: fill===false
-    // emits no fill()) and material.stroke (outline the run in the same batch).
-    // For the default fill:true / stroke:null material only the style breaks a run,
-    // so the fill path is byte-identical to v1.3.0. Shade is a single shadeL read;
-    // the v1.3.0 per-face quatRotate + dot + clamp + float-to-int is GONE.
-    let curStyle = null, open = false, curFill = false, curStroke = null, curLineWidth = 0;
+    const L = stage.light, lx = L[0], ly = L[1], lz = L[2];
+    let curStyle = null, open = false;
 
     for (let i = 0; i < dc; i++) {
       const e = order[i], d = drawNode[e], fi = drawFace[e];
@@ -825,7 +714,7 @@ export function createStage(ctx, opts) {
       const base = vertBase[d];
 
       if (fi === 0xFFFFFFFF) {  // stroke polyline
-        if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } open = false; curStyle = null; }
+        if (open) { c.fill(); open = false; curStyle = null; }
         c.strokeStyle = mat.stroke || mat.lut[mat.K - 1];
         c.lineWidth = mat.lineWidth;
         c.beginPath();
@@ -834,12 +723,15 @@ export function createStage(ctx, opts) {
         continue;
       }
 
-      const style = mat.lut[shadeL[e]];      // shade baked in collect; one lane read
-      const fillNow = mat.fill, strokeNow = mat.stroke;
+      // shade: rotate face normal by node quaternion, dot with light
+      quatRotate(_NRM, qxL[d], qyL[d], qzL[d], qwL[d], g.faceNormal[fi * 3], g.faceNormal[fi * 3 + 1], g.faceNormal[fi * 3 + 2]);
+      let ndl = _NRM[0] * lx + _NRM[1] * ly + _NRM[2] * lz;
+      if (ndl < 0) ndl = 0;
+      const style = mat.lut[(ndl * (mat.K - 1)) | 0];
 
-      if (style !== curStyle || fillNow !== curFill || strokeNow !== curStroke) {
-        if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } }
-        c.fillStyle = style; curStyle = style; curFill = fillNow; curStroke = strokeNow; curLineWidth = mat.lineWidth; c.beginPath(); open = true;
+      if (style !== curStyle) {
+        if (open) { c.fill(); st.drawCalls++; }
+        c.fillStyle = style; curStyle = style; c.beginPath(); open = true;
       }
       const off = g.faceVertOffset[fi], o1 = g.faceVertOffset[fi + 1], fv = g.faceVerts;
       for (let j = off; j < o1; j++) {
@@ -849,10 +741,10 @@ export function createStage(ctx, opts) {
       c.closePath();
       st.facesDrawn++;
     }
-    if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } }
+    if (open) { c.fill(); st.drawCalls++; }
   }
 
   return stage;
 }
 
-export const version = '1.4.0';
+export const version = '1.3.0';

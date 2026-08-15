@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.3.0
+# @zakkster/lite-depth v1.4.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -52,7 +52,15 @@ Quads/n-gons first-class. Normals via Newell's method.
     material({ r=90,g=200,b=120, ambient=0.35, steps=64, stroke=null,
                lineWidth=2, fill=true })   // bakes a K-step hex ramp
     materialFromRamp(hexRamp, { stroke, lineWidth, fill })  // e.g. lite-hueforge scale
-Per-frame shade is one LUT index: lut[(ndl*(K-1))|0]. No per-frame string build.
+Per-frame shade is one LUT index, baked into the shade lane during collect and
+read once by paint: lut[shade]. No per-frame string build, no per-face normal math
+in the paint loop.
+K CAP: steps (and a materialFromRamp ramp length) is capped at 256 -- the per-frame
+shade lane is a Uint8Array, so an index must fit 0..255. A larger ramp THROWS at
+creation (fail closed, did-you-mean hint) rather than silently wrapping to step 0.
+fill=false: the face is NOT filled (honoured since v1.4.0; before, fill:false still
+filled). stroke set: the face OUTLINE is stroked in the same style-run batch --
+fill:false + stroke gives a wireframe; fill:true + stroke gives fill-then-outline.
 
 ## Nodes (Stage methods; h = generational NodeHandle)
 
@@ -90,7 +98,12 @@ matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
     // s = { facesDrawn, facesCulled, nodesCulled, drawCalls,
     //       tTransform, tProject, tSort, tPaint,          (ms for the t* fields)
     //       facesOverflowed,   // nodes skipped by the vert/draw-face overflow door
-    //       nodesInvalid,      // reserved always-zero hook (NaN reject, later milestone)
+    //       nodesInvalid,      // nodes rejected by the fail-closed collect door:
+    //                          // a non-finite (NaN/Inf) pose lane, centroid, radius
+    //                          // or bias -> whole node skipped, never laundered
+    //       nodesNonUniform,   // drawn nodes with a non-uniform LOCAL scale (flag);
+    //                          // inherited-only descendants are shaded via the
+    //                          // inverse-transpose too but are not counted here
     //       nodesOrphaned,     // nodes whose dead parent forced a ROOT reparent
     //       nodesTotal }       // live node count this frame
 
@@ -114,6 +127,23 @@ Effect writes lanes + marks dirty on the cold path; frame loop only reads lanes.
 
 stage.light is a normalized Float64Array[3] directional light. Flat per-face
 shading = clamp(dot(worldNormal, light), 0, 1), ambient floor from the material.
+worldNormal is derived from the node's WORLD matrix (the same transform the
+geometry is drawn from), NOT the local quaternion -- so a child of a rotated /
+scaled parent is lit correctly (fixed in v1.4.0; before, hierarchical scenes were
+mis-lit). Mechanics, computed ONCE per node in collect:
+  - Uniform world basis (a similarity): the light is back-rotated into the
+    geometry's local frame, and each face is a single sqrt-free dot with its
+    precomputed local normal.
+  - Non-uniform world basis: the normal matrix (inverse-transpose / adjugate of the
+    world upper-3x3) is built once, and each face does normal*matrix, normalize,
+    dot. This path is selected by a per-node WORLD non-uniform bit that propagates
+    down the hierarchy in topo order (own non-uniform local scale OR any
+    non-uniform ancestor -- rotation is a similarity and does NOT taint), so an
+    inherited non-uniform scale is handled correctly.
+The shade is baked into a per-draw shade lane during collect; paint() reads that
+lane -- no per-face normal math. stats.nodesNonUniform counts drawn nodes with a
+non-uniform LOCAL scale (the flag); inherited-only descendants are shaded via the
+inverse-transpose but are not themselves counted.
 
 ## Math kernels (out-param, no classes; affine 3x4 row-major)
 
