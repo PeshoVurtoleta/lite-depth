@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth — Zero-GC Canvas2D software-projected 3D (v1.4.0 "Painter")
+ * @zakkster/lite-depth -- Zero-GC Canvas2D software-projected 3D (v1.5.0 "Painter")
  *
  * Zdog's niche — flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
  * canvas — but arena-backed and allocation-free on the frame loop. Zdog allocates
@@ -10,7 +10,7 @@
  *
  * Substrate deps (runtime): @zakkster/lite-arena  (node store, generational handles)
  *                           @zakkster/lite-fastbit32 (flag namespace + masks)
- *                           @zakkster/lite-aabb    (per-face viewport cull)
+ *                           @zakkster/lite-aabb    (packed node-box lane + scene-bbox merge)
  * Optional peers (cold path only): @zakkster/lite-signal via stage.useSignals().
  *
  * @author Zahary Shinikchiev
@@ -19,7 +19,12 @@
 
 import { Arena } from '@zakkster/lite-arena';
 import { BitMapper } from '@zakkster/lite-fastbit32';
-import { aabb2 } from '@zakkster/lite-aabb';
+import { aabb2, FORMAT_VERSION } from '@zakkster/lite-aabb';
+
+// Re-export the peer's packed-format contract version so a consumer can compare
+// it against its own lite-aabb (the nodeBox lane + scene-bbox merge depend on the
+// [minX,minY,maxX,maxY] float32x4 layout being format 1). createStage asserts it.
+export { FORMAT_VERSION };
 
 /* ─────────────────────────────── constants ─────────────────────────────── */
 
@@ -90,6 +95,16 @@ function quatRotate(out, qx, qy, qz, qw, vx, vy, vz) {
 }
 
 export const mathKernels = { composeTRS, mulAffine, quatRotate };
+
+// Round an f64 screen bound OUTWARD to a conservative f32 for the node-box lane:
+// nudge by ~one f32 ULP (2^-23 relative) in `dir` (-1 for a min side, +1 for a
+// max side) so the stored f32 box never clips the true f64 box. Used only under
+// the opt-in dirtyRect lane (never on the default hot path). Zero allocation.
+const F32_ULP = 1.1920929e-7;
+function froundOut(x, dir) {
+  const f = Math.fround(x);
+  return f + dir * ((f < 0 ? -f : f) * F32_ULP + 1e-30);
+}
 
 /* ─────────────────────────────── geometry ──────────────────────────────── */
 // A geometry is shared and instanced per node. Vertices are Float32 (read-only
@@ -286,6 +301,14 @@ export function updateCamera(cam) {
 /* ─────────────────────────────── stage ─────────────────────────────────── */
 
 export function createStage(ctx, opts) {
+  // Fail closed if the peer's packed AABB layout ever drifts underneath us: the
+  // per-node screen box lane (nodeBox) and the once-per-frame scene-bbox merge
+  // both assume the [minX,minY,maxX,maxY] float32x4 format (FORMAT_VERSION 1).
+  if (FORMAT_VERSION !== 1) {
+    throw new Error('lite-depth: @zakkster/lite-aabb FORMAT_VERSION=' + FORMAT_VERSION +
+      ' but lite-depth is built against packed format 1 ([minX,minY,maxX,maxY]). ' +
+      'The nodeBox cull + scene-bbox merge assume that layout -- upgrade lite-depth.');
+  }
   const o = opts || {};
   let maxNodes = o.maxNodes || 4096;
   const maxVerts = o.maxVerts || 262144;      // total projected verts per frame
@@ -353,15 +376,28 @@ export function createStage(ctx, opts) {
   // LOCAL flag; this lane is the dynamic world property the shade branch gates on.
   let worldNonUnif = new Uint8Array(maxNodes);
 
-  // aabb scratch (lite-aabb)
-  const _box = aabb2.create();
-  const _viewport = aabb2.create();
+  // Per-node screen-space AABB lane + scene-bbox scratch (lite-aabb packed format).
+  // nodeBox[4d..4d+3] = dense node d's front-of-near screen box THIS frame (written
+  // only under the opt-in dirtyRect lane); _sceneBox is their union, _prevBox the
+  // previous frame's union for a redraw delta. Grown in lockstep by reserve().
+  let nodeBox = new Float32Array(4 * maxNodes);
+  const _sceneBox = aabb2.setEmpty(aabb2.create());
+  const _prevBox = aabb2.setEmpty(aabb2.create());
+  // Cached viewport cull scalars (was the _viewport box; the per-face intersects is
+  // now four inline compares). Viewport is (0,0,width,height) -- the screen space
+  // screenXY is computed in. Refreshed at create + resize (cold).
+  let _vx0 = 0, _vy0 = 0, _vx1 = 0, _vy1 = 0;
 
   const stage = {
     ctx, arena, nodes, camera: createCamera(o.camera),
     width: o.width || 800, height: o.height || 600, dpr: o.dpr || 1,
     light: new Float64Array([0.4, 0.8, 0.5]),   // normalized below
     view2d: null,                                // optional external 2D transform (lite-camera)
+    // Opt-in dirty-rect lane. OFF by default: when false the frame body writes no
+    // nodeBox slot and runs no scene-bbox merge -- zero added hot cost. Set true to
+    // maintain sceneBox/prevBox for incremental canvas redraw. The per-node screen
+    // AABB *cull* is always on and independent of this flag.
+    dirtyRect: false,
     _signals: null,
     stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0 },
     _topoDirty: true,
@@ -375,11 +411,18 @@ export function createStage(ctx, opts) {
     // they belong to the stage's initial hidden class (same reason as above).
     get structureEpoch() { return _structureEpoch; },
     get remainingNodes() { return arena.remainingCapacity(); },
+    // Read-only scene bounding box (union of this frame's drawn node boxes) and
+    // the previous frame's, for an opt-in redraw delta. Both are the canonical
+    // empty box until dirtyRect is enabled and a frame runs. Getters live in the
+    // literal so they belong to the stage's initial hidden class (same reason as
+    // the draw-order accessors above).
+    get sceneBox() { return _sceneBox; },
+    get prevSceneBox() { return _prevBox; },
   };
   stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY };
   stage._geometries = geometries;
   { const l = stage.light, inv = 1 / (Math.hypot(l[0], l[1], l[2]) || 1); l[0] *= inv; l[1] *= inv; l[2] *= inv; }
-  aabb2.set(_viewport, 0, 0, stage.width, stage.height);
+  _vx0 = 0; _vy0 = 0; _vx1 = stage.width; _vy1 = stage.height;
   updateCamera(stage.camera);
 
   /* ── cold node API ── */
@@ -427,7 +470,7 @@ export function createStage(ctx, opts) {
   stage.setDepthBias = (h, bias) => { nodes.data.bias[nodes.idx(h)] = bias; };
   stage.setVisible = (h, v) => { const d = nodes.idx(h), D = nodes.data; if (v) D.flags[d] |= F_VISIBLE; else D.flags[d] &= ~F_VISIBLE; };
   stage.remove = (h) => { arena.despawn(h); stage._topoDirty = true; _structureEpoch = (_structureEpoch + 1) >>> 0; };
-  stage.resize = (w, hh, dpr) => { stage.width = w; stage.height = hh; stage.dpr = dpr || stage.dpr; aabb2.set(_viewport, 0, 0, w, hh); };
+  stage.resize = (w, hh, dpr) => { stage.width = w; stage.height = hh; stage.dpr = dpr || stage.dpr; _vx0 = 0; _vy0 = 0; _vx1 = w; _vy1 = hh; };
 
   // Remove every node in one cold O(capacity) pass without reallocating: the
   // arena resets its pool (advancing every generation, so every handle minted
@@ -461,6 +504,7 @@ export function createStage(ctx, opts) {
     // Grow every stage-owned maxNodes-sized lane. new-then-copy: the live prefix
     // [0, count) is preserved; the tail is fresh zero. Cold allocation is legal.
     const nv = new Int32Array(n); nv.set(vertBase); vertBase = nv; stage._draw.vertBase = nv;
+    const nnb = new Float32Array(4 * n); nnb.set(nodeBox); nodeBox = nnb;  // node-box lane: 4 floats/node
     const nt = new Uint32Array(n); nt.set(topo); topo = nt;
     const npd = new Int32Array(n); npd.set(parentDense); parentDense = npd;
     const nr = new Uint8Array(n); nr.set(recomputed); recomputed = nr;
@@ -612,6 +656,17 @@ export function createStage(ctx, opts) {
     // the shadeL lane in this pass (per node: back-rotate the light through the
     // WORLD upper-3x3; per face: one dot). paint() no longer touches the light.
     const light = stage.light, lgx = light[0], lgy = light[1], lgz = light[2];
+    // Cached viewport cull scalars -> frame locals. The per-face viewport test is
+    // four inline compares against these (was aabb2.set + aabb2.intersects).
+    const vx0 = _vx0, vy0 = _vy0, vx1 = _vx1, vy1 = _vy1;
+    // Opt-in dirty-rect lane, hoisted once (a per-node read would cost bytes every
+    // node). When on, seed every LIVE node's box empty so any node the loop skips
+    // (invisible / invalid / overflowed / node-culled / fail-open) contributes the
+    // merge identity to the scene bbox; drawn nodes overwrite their slot below.
+    const wantBox = stage.dirtyRect === true;
+    if (wantBox) {
+      for (let d = 0; d < count; d++) { const j = d << 2; nodeBox[j] = Infinity; nodeBox[j + 1] = Infinity; nodeBox[j + 2] = -Infinity; nodeBox[j + 3] = -Infinity; }
+    }
     let vc = 0, dc = 0;
 
     for (let i = 0; i < count; i++) {
@@ -642,6 +697,8 @@ export function createStage(ctx, opts) {
       vertBase[d] = vc;
       const gv = g.verts, GV = g.V;
       const M0 = m0[d], M1 = m1[d], M2 = m2[d], M3 = m3[d], M4 = m4[d], M5 = m5[d], M6 = m6[d], M7 = m7[d], M8 = m8[d], M9 = m9[d], M10 = m10[d], M11 = m11[d];
+      // Node screen-box registers: union over FRONT-OF-NEAR verts only (see below).
+      let nbMinX = Infinity, nbMinY = Infinity, nbMaxX = -Infinity, nbMaxY = -Infinity;
       for (let v = 0; v < GV; v++) {
         const lx = gv[v * 3], ly = gv[v * 3 + 1], lz = gv[v * 3 + 2];
         const wx = M0 * lx + M1 * ly + M2 * lz + M3;
@@ -652,17 +709,56 @@ export function createStage(ctx, opts) {
         const vz = V[8] * wx + V[9] * wy + V[10] * wz + V[11];
         const idx = vc + v;
         viewZ[idx] = vz;
-        if (ortho) { screenXY[idx * 2] = halfW + vx * orthoK; screenXY[idx * 2 + 1] = halfH - vy * orthoK; }
-        else { const inv = focal / (-vz); screenXY[idx * 2] = halfW + vx * inv; screenXY[idx * 2 + 1] = halfH - vy * inv; }
+        let sX, sY;
+        if (ortho) { sX = halfW + vx * orthoK; sY = halfH - vy * orthoK; }
+        else { const inv = focal / (-vz); sX = halfW + vx * inv; sY = halfH - vy * inv; }
+        screenXY[idx * 2] = sX; screenXY[idx * 2 + 1] = sY;
+        // Accumulate the node's screen box over FRONT-OF-NEAR verts ONLY (z<=-near).
+        // A behind-near vert projects to +/-Infinity/garbage; folding it in would
+        // poison the box and wrongly drop a visible node -- so it is excluded here
+        // and the node-box door below fails OPEN on an empty/non-finite box.
+        if (vz <= -near) {
+          if (sX < nbMinX) nbMinX = sX; if (sX > nbMaxX) nbMaxX = sX;
+          if (sY < nbMinY) nbMinY = sY; if (sY > nbMaxY) nbMaxY = sY;
+        }
       }
       vc += GV;
 
       if ((flags[d] & F_STROKE) !== 0) {
+        // Strokes are NOT node-box-culled: a polyline may cross the viewport
+        // between two off-screen endpoints, so v1.4.0 stroke behaviour is kept.
+        // Still feed the dirty-rect lane when a valid box exists.
+        if (wantBox && nbMinX <= nbMaxX && nbMinY <= nbMaxY) {
+          const j = d << 2;
+          nodeBox[j] = froundOut(nbMinX, -1); nodeBox[j + 1] = froundOut(nbMinY, -1);
+          nodeBox[j + 2] = froundOut(nbMaxX, 1); nodeBox[j + 3] = froundOut(nbMaxY, 1);
+        }
         // one draw entry for the whole polyline at its centre depth
         drawKey[dc] = packKey(layerL[d], quantize(cvz + bias, near, far, zSpan));
         drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; dc++;
         continue;
       }
+
+      // Per-node screen-space AABB cull (fills). Two DELIBERATELY OPPOSITE doors:
+      //   node-box empty/non-finite => DRAW (fail OPEN): a wrongly-fired geometry
+      //     cull LOSES PICTURE, so an unbuildable box errs toward drawing. The face
+      //     loop's own per-face near cull then rejects the behind-near faces, so the
+      //     facesCulled tally is byte-identical to v1.4.0 for such a node.
+      //   face-bound NaN (in the face loop below) => CULL (fail CLOSED): losing a
+      //     degenerate face is safe.
+      // A VALID box that misses the viewport culls the whole node: nodesCulled +1
+      // and the face loop runs ZERO iterations.
+      if (nbMinX <= nbMaxX && nbMinY <= nbMaxY) {           // valid, non-empty, finite
+        if (!(nbMinX <= vx1 && nbMaxX >= vx0 && nbMinY <= vy1 && nbMaxY >= vy0)) {
+          st.nodesCulled++; continue;                        // nodeBox stays empty (pre-pass)
+        }
+        if (wantBox) {
+          const j = d << 2;
+          nodeBox[j] = froundOut(nbMinX, -1); nodeBox[j + 1] = froundOut(nbMinY, -1);
+          nodeBox[j + 2] = froundOut(nbMaxX, 1); nodeBox[j + 3] = froundOut(nbMaxY, 1);
+        }
+      }
+      // else: empty/non-finite node box -> FAIL OPEN, fall through and draw.
 
       // Per-node shade setup (D-03/D-04), hoisted ABOVE the face loop and computed
       // ONCE per node. Shade = clamp(dot(normalize(worldNormal), light), 0, 1),
@@ -712,7 +808,7 @@ export function createStage(ctx, opts) {
         const o0 = off[fi], o1 = off[fi + 1], n = o1 - o0;
         // near cull: any vertex in front of near plane
         let nearBad = false, czSum = 0;
-        let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+        let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
         for (let j = o0; j < o1; j++) {
           const vi = base + fv[j], z = viewZ[vi];
           if (z > -near) { nearBad = true; break; }
@@ -721,9 +817,11 @@ export function createStage(ctx, opts) {
           if (X < minx) minx = X; if (X > maxx) maxx = X; if (Y < miny) miny = Y; if (Y > maxy) maxy = Y;
         }
         if (nearBad) { st.facesCulled++; continue; }
-        // viewport cull via lite-aabb
-        aabb2.set(_box, minx, miny, maxx, maxy);
-        if (!aabb2.intersects(_box, _viewport)) { st.facesCulled++; continue; }
+        // viewport cull, inline (was aabb2.set + aabb2.intersects). Byte-identical
+        // to the intersects predicate against the cached viewport scalars. A NaN
+        // face bound makes a compare false => the face is culled = FAIL CLOSED
+        // (losing a degenerate face is safe; the inverse of the node-box door).
+        if (!(minx <= vx1 && maxx >= vx0 && miny <= vy1 && maxy >= vy0)) { st.facesCulled++; continue; }
         // backface cull via screen winding (signed area), unless double-sided
         const a0 = base + fv[o0], a1 = base + fv[o0 + 1], a2 = base + fv[o0 + 2];
         const ax = screenXY[a0 * 2], ay = screenXY[a0 * 2 + 1];
@@ -759,6 +857,12 @@ export function createStage(ctx, opts) {
       }
     }
     st.tProject = clock.now() - t;
+
+    // Opt-in scene-bbox merge (dirty-rect lane). Snapshot last frame's union into
+    // _prevBox for a redraw delta, then fold THIS frame's node boxes into _sceneBox
+    // once (count-bounded; skipped/culled slots are the empty merge identity, so a
+    // fully-empty frame yields the canonical empty box). Off => zero added cost.
+    if (wantBox) { aabb2.copy(_prevBox, _sceneBox); aabb2.mergeAll(_sceneBox, nodeBox, count); }
 
     /* radix sort permutation of [0,dc) by drawKey (LSD, 4x8-bit) */
     t = clock.now();
@@ -855,4 +959,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.4.0';
+export const version = '1.5.0';

@@ -167,7 +167,11 @@ the composition hook for a 2D screen-space camera (shake, framing) over the 3D s
 
 Runs the pipeline and returns `{ facesDrawn, facesCulled, nodesCulled,
 drawCalls, tTransform, tProject, tSort, tPaint, facesOverflowed, nodesInvalid,
-nodesNonUniform, nodesOrphaned, nodesTotal }`. `facesOverflowed` counts nodes the
+nodesNonUniform, nodesOrphaned, nodesTotal }`. `nodesCulled` counts nodes rejected
+by the coarse depth/frustum reject **or** the per-node screen-space AABB cull (see
+below) -- a screen-box-culled node runs zero face-loop iterations, so its faces are
+not counted in `facesCulled` (the v1.5.0 semantics shift; a node at least partially
+on screen is byte-identical to 1.4.0). `facesOverflowed` counts nodes the
 frame-arena overflow door skipped (size up `maxVerts` / `maxDrawFaces` when it is
 nonzero); `nodesInvalid` counts nodes the fail-closed collect door rejected for a
 non-finite (NaN/Infinity) pose lane, centroid, radius or bias — the whole node is
@@ -176,6 +180,32 @@ nodes with a non-uniform **local** scale (the `NON_UNIFORM_SCALE` inverse-transp
 feature — a locally-uniform child under a non-uniform ancestor is still lit through
 the inverse-transpose, but is not itself counted); `nodesOrphaned` counts
 dead-parent reparents; `nodesTotal` is the live count.
+
+### Per-node screen cull + opt-in dirty-rect (v1.5.0)
+
+Each visible node accumulates a screen-space AABB over its **front-of-near**
+vertices (`z <= -near`) during projection. If that box misses the viewport the
+whole node is culled before its face loop runs (`nodesCulled` +1, zero face-loop
+work). Two deliberately opposite doors: a face-bound `NaN` makes a viewport compare
+false, so the **face** is culled -- **fail closed**, losing a degenerate face is
+safe; a node whose box is **empty or non-finite** (every vertex behind the near
+plane) is **drawn, never node-culled** and never counted in `nodesInvalid` --
+**fail open**, because a wrongly-fired geometry cull loses picture (its faces are
+then rejected by the per-face near door, exactly as 1.4.0).
+
+```js
+stage.dirtyRect = true;         // opt-in (default false); OFF => zero added hot cost
+const s = stage.frame(16);
+repaintRegion(stage.sceneBox);  // Float32Array [minX,minY,maxX,maxY] this frame
+// stage.prevSceneBox holds last frame's union, for a redraw delta
+```
+
+When `dirtyRect` is enabled, each drawn node's screen box is stored (rounded
+**outward** to f32 so the stored box never clips the true box) and merged once per
+frame into `stage.sceneBox`; the previous frame's union stays in
+`stage.prevSceneBox`. The per-node cull itself is always on and independent of the
+flag. `FORMAT_VERSION` re-exports the `@zakkster/lite-aabb` packed-format contract
+version and is asserted `=== 1` in `createStage`.
 
 ### lite-signal DI (cold path)
 

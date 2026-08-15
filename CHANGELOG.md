@@ -4,6 +4,65 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-08-15
+
+Per-node screen-space cull + opt-in dirty-rect (roadmap D3). The per-face viewport
+test loses its `aabb2.set` + `aabb2.intersects` pair for four inline positive-form
+compares against cached viewport scalars (the min/max already fall out of the
+per-face vertex loop). A new per-node screen-space AABB cull rejects a whole node
+whose projected box misses the viewport BEFORE its face loop runs, and an opt-in
+`stage.dirtyRect` lane exposes the merged scene bounding box for incremental redraw.
+The default hot path stays at 0 B/op with `gc major=0`; the dirtyRect lane and the
+node-box cull are proven zero-alloc by the torture gate's new Phase D.
+
+> **STATS SEMANTICS CHANGE (`nodesCulled` / `facesCulled`).** A node whose projected
+> screen box misses the viewport is now culled WHOLE: `stats.nodesCulled` counts it
+> and its face loop runs ZERO iterations, so its faces are no longer tallied in
+> `stats.facesCulled`. Previously every off-screen face was counted individually in
+> `facesCulled`. For any node at least partially on screen, `facesDrawn` and
+> `facesCulled` are byte-identical to 1.4.0 (the per-face test is unchanged, only
+> inlined). Rendered pixels are unchanged.
+
+### Added
+
+- **Per-node screen-space AABB cull.** Each visible node accumulates a screen box
+  over its FRONT-OF-NEAR vertices (`z <= -near`) during projection. If the box
+  misses the cached viewport scalars the whole node is culled (`stats.nodesCulled`
+  +1) and its face loop is skipped entirely. A node whose box is empty or non-finite
+  (all verts behind the near plane) FAILS OPEN -- it is drawn, never node-culled and
+  never counted in `nodesInvalid`, because a wrongly-fired geometry cull loses
+  picture; its faces are then rejected by the existing per-face near door,
+  byte-identical to 1.4.0. This is the deliberate inverse of the face-bound-NaN
+  door, which fails CLOSED (a NaN face bound makes a compare false, so the face is
+  culled -- losing a degenerate face is safe).
+- **Opt-in `stage.dirtyRect` (default `false`).** When enabled, each drawn node's
+  screen box is stored (rounded OUTWARD to f32 so the stored box never clips the
+  true box) into a packed `nodeBox` lane and merged once per frame into a new
+  `stage.sceneBox` getter (packed lite-aabb `Float32Array[4]`); the previous
+  frame's union is kept in `stage.prevSceneBox` for a redraw delta. OFF => zero
+  added hot cost (no per-node box write, no merge). The `nodeBox` lane grows in
+  lockstep with the other node lanes in `stage.reserve(n)`.
+- **`FORMAT_VERSION` re-export.** `@zakkster/lite-aabb`'s packed-format contract
+  version is re-exported and asserted `=== 1` in `createStage` (fail closed with a
+  clear throw if the peer's `[minX, minY, maxX, maxY]` float32x4 layout ever drifts).
+
+### Changed
+
+- **Per-face viewport cull inlined.** The per-face `aabb2.set(_box, ...)` +
+  `aabb2.intersects(_box, _viewport)` pair is replaced by four inline compares
+  (`minx <= vx1 && maxx >= vx0 && miny <= vy1 && maxy >= vy0`) against viewport
+  scalars cached at create/resize. Byte-identical to the `intersects` predicate;
+  the face-bound min/max seed is now `Infinity` / `-Infinity`.
+
+### Tested
+
+- Torture gate gains **Phase D** (node-box cull): an inverted control (an on-screen
+  node is never node-culled), an edge matrix (a node off each of the four viewport
+  edges + two corners culls the whole node with zero face-loop work, exercising each
+  inline compare), the fail-open door (a behind-near node is drawn, not culled), and
+  a dense down-z stage with `dirtyRect` enabled + ~1/3 nodes off-screen driven
+  through the same `measureOps` + `measureAllocs` windows at 0 major GC / 0 B/op.
+
 ## [1.4.0] - 2026-08-15
 
 Shading correctness (roadmap D2). One bug in four costumes: the shading path read

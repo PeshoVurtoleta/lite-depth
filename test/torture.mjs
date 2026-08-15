@@ -43,6 +43,22 @@
  *     than always printing ok. If the deliberately-leaky frame is reported clean,
  *     die().
  *
+ *   Phase D (node-box cull -- correctness + zero-alloc lane) -- exercises the
+ *     v1.5.0 per-node screen-space AABB cull and the opt-in dirtyRect lane. A
+ *     down-z camera maps world x/y to screen x/y, so a lateral offset pushes a
+ *     node off-screen while its depth stays in-frustum -- the SCREEN-box cull, not
+ *     the coarse depth reject, is what fires. It gates three things: an INVERTED
+ *     control (an on-screen node is NEVER node-box-culled), an EDGE MATRIX (a node
+ *     off each of the four viewport edges + two corners must cull the whole node
+ *     with ZERO face-loop work, so each of the four inline compares is the one
+ *     that trips), and the FAIL-OPEN door (a node whose verts are all behind the
+ *     near plane builds an empty box and MUST still be drawn, its faces rejected
+ *     by the per-face near door exactly as v1.4.0 -- geometry culling that fires
+ *     wrongly loses picture). Then a dense down-z stage with dirtyRect ENABLED and
+ *     ~1/3 of nodes off-screen is driven through the same measureOps + measureAllocs
+ *     windows: the nodeBox writes, the once-per-frame scene-bbox merge and the
+ *     culled-slot path must all stay 0 major GC and 0 bytes/op.
+ *
  * A pass means something only if the gate can fail. Phase C is the always-on
  * self-control; DEPTH_TORTURE_LEAK=1 is the Phase-A retention control:
  *
@@ -261,6 +277,102 @@ function phaseC() {
   return { caught: !report.ok, retained: cSink.length, verdict: report.verdict };
 }
 
+// --- Phase D: node-box cull -- correctness matrix + fail-open + zero-alloc lane -
+
+// A camera looking straight down -z from (0,0,radius): the world x/y axes map to
+// screen x/y, so a lateral offset pushes a node OFF-SCREEN while its view depth
+// stays in-frustum -- forcing the new SCREEN-space AABB cull to fire, NOT the
+// coarse depth reject. Deterministic geometry so every assertion is exact.
+function nodeBoxCam() { return { theta: 0, phi: Math.PI / 2, radius: 40, near: 0.5, far: 200 }; }
+
+// Build a dense down-z stage where ~1/3 of nodes are shoved fully off-screen (in
+// depth), so the measured window exercises the cull's culled-slot path AND the
+// opt-in dirtyRect lane (nodeBox writes + once-per-frame scene-bbox merge).
+function buildNodeBoxStage(count) {
+  const stage = createStage(makeCtx(), { maxNodes: count, width: 800, height: 600, camera: nodeBoxCam() });
+  stage.dirtyRect = true;
+  const gid = stage.geometry(geometry.box(1, 1, 1));
+  const mid = stage.material(material({ r: 200, g: 120, b: 90 }));
+  for (let i = 0; i < count; i++) {
+    if ((i % 3) === 0) stage.addNode(gid, mid, { x: 120, y: 0, z: 0 });                  // off-screen right, in-depth
+    else stage.addNode(gid, mid, { x: (i % 7) - 3, y: ((i / 7 | 0) % 7) - 3, z: 0 });    // on-screen cluster
+  }
+  return stage;
+}
+
+function phaseD() {
+  // --- correctness matrix on a single node (small, exact) --------------------
+  const s = createStage(makeCtx(), { width: 800, height: 600, maxNodes: 8, camera: nodeBoxCam() });
+  const gid = s.geometry(geometry.box(1, 1, 1)), mid = s.material(material({}));
+  const h = s.addNode(gid, mid, {});
+
+  // (1) INVERTED CONTROL: an on-screen node must NOT be node-box-culled. If this
+  // fires, the cull is over-eager and drops picture -- the whole feature is unsafe.
+  s.setPosition(h, 0, 0, 0); s.frame(DT);
+  if (s.stats.facesDrawn <= 0) die('phaseD: on-screen node drew nothing');
+  if (s.stats.nodesCulled !== 0) die('phaseD: on-screen node was node-box-culled (nodesCulled=' + s.stats.nodesCulled + ')');
+  const drawnOnScreen = s.stats.facesDrawn;
+
+  // (2) EDGE MATRIX: push the node fully off each viewport edge (and two corners),
+  // in-depth every time, so all four inline compares (minx<=vx1, maxx>=vx0,
+  // miny<=vy1, maxy>=vy0) are each the one that trips. Every row MUST cull the
+  // whole node: nodesCulled +1, and the face loop runs ZERO iterations
+  // (facesDrawn 0, facesCulled 0 -- no per-face work at all).
+  const EDGES = [[120, 0, 0], [-120, 0, 0], [0, 120, 0], [0, -120, 0], [120, 120, 0], [-120, -120, 0]];
+  for (let r = 0; r < EDGES.length; r++) {
+    const row = EDGES[r];
+    s.setPosition(h, row[0], row[1], row[2]); s.frame(DT);
+    if (s.stats.nodesCulled !== 1) die('phaseD: off-screen row ' + r + ' not node-box-culled (nodesCulled=' + s.stats.nodesCulled + ')');
+    if (s.stats.facesDrawn !== 0) die('phaseD: culled row ' + r + ' still drew ' + s.stats.facesDrawn + ' faces');
+    if (s.stats.facesCulled !== 0) die('phaseD: culled row ' + r + ' ran the face loop (facesCulled=' + s.stats.facesCulled + ' must be 0)');
+    if (s.stats.nodesInvalid !== 0) die('phaseD: node-box cull wrongly bumped nodesInvalid on row ' + r);
+  }
+
+  // (3) FAIL-OPEN control: a node whose verts are ALL behind the near plane builds
+  // an empty node box. It MUST still be drawn (never node-box-culled) -- a wrongly
+  // fired geometry cull loses picture. Its faces are then all near-culled by the
+  // face door, exactly as v1.4.0: nodesCulled 0, facesDrawn 0, facesCulled > 0
+  // (the face door, not the node door, did the rejecting).
+  s.setPosition(h, 0, 0, 40.2); s.frame(DT);   // just behind the eye (z=radius): vz=+0.2 center, every vert vz > -near -> empty box
+  if (s.stats.nodesCulled !== 0) die('phaseD: behind-near node was node-box-culled -- FAIL-OPEN violated (nodesCulled=' + s.stats.nodesCulled + ')');
+  if (s.stats.facesDrawn !== 0) die('phaseD: behind-near node drew ' + s.stats.facesDrawn + ' faces (all should near-cull)');
+  if (s.stats.facesCulled <= 0) die('phaseD: behind-near node did not reach the per-face near door (facesCulled=' + s.stats.facesCulled + ')');
+
+  // --- zero-alloc proof of the cull + opt-in dirtyRect lane ------------------
+  const dense = buildNodeBoxStage(DENSE);
+  dense.frame(DT);
+  if (dense.stats.nodesCulled <= 0) die('phaseD: dense scatter never exercised the node-box cull (nodesCulled=0)');
+  if (dense._drawCount <= 0) die('phaseD: dense node-box stage produced an empty draw list');
+  // dirtyRect lane actually ran: the scene box must be a valid, finite, non-empty
+  // box (the union of the on-screen cluster). A stale empty box means the merge
+  // was skipped.
+  const sb = dense.sceneBox;
+  const sceneValid = Number.isFinite(sb[0]) && Number.isFinite(sb[1]) && Number.isFinite(sb[2]) && Number.isFinite(sb[3]) && sb[0] <= sb[2] && sb[1] <= sb[3];
+  if (!sceneValid) die('phaseD: dirtyRect scene box invalid/empty after a drawn frame [' + sb[0] + ',' + sb[1] + ',' + sb[2] + ',' + sb[3] + ']');
+
+  let accD = 0;
+  const gcRes = measureOps(function () {
+    const st = dense.frame(DT);
+    accD = accD + st.facesDrawn + st.nodesCulled;
+  }, { ops: HOT_FRAMES, warmup: 8, source: 'gc', stabilize: 'deep' });
+  if (!Number.isFinite(accD) || accD <= 0) die('phaseD: node-box frame loop produced no work (acc=' + accD + ')');
+  const report = checkNoGc(gcRes.summary, RULES);
+
+  const dense2 = buildNodeBoxStage(DENSE);
+  dense2.frame(DT);
+  let accD2 = 0;
+  const alloc = measureAllocs(function () {
+    const st = dense2.frame(DT);
+    accD2 = accD2 + st.facesDrawn;
+  }, { iterations: 4096, warmup: 16 });
+  if (!Number.isFinite(accD2)) die('phaseD: node-box alloc probe produced non-finite acc');
+
+  return {
+    report, bytesPerCall: alloc.bytesPerCall,
+    culled: dense.stats.nodesCulled, drawnOnScreen, sceneValid,
+  };
+}
+
 // --- gate --------------------------------------------------------------------
 
 function main() {
@@ -271,9 +383,10 @@ function main() {
   const a = phaseA();
   const b = phaseB();
   const c = phaseC();
+  const d = phaseD();
 
   const retentionOk = a.activeCount === 0 && a.nodesCount === 0 && a.trackerSize === 0 && a.findings === 0;
-  const budgetOk = b.report.ok && b.bytesPerCall === 0;
+  const budgetOk = b.report.ok && b.bytesPerCall === 0 && d.report.ok && d.bytesPerCall === 0;
   const controlOk = c.caught;
 
   const g = b.summary.gc;
@@ -297,9 +410,14 @@ function main() {
     process.stderr.write(
       'torture: budget -- verdict=' + b.report.verdict + ' major=' + g.major +
       ' maxMs=' + g.maxMs.toFixed(3) + ' bytesPerCall=' + b.bytesPerCall +
+      ' | nodeBox verdict=' + d.report.verdict + ' bytesPerCall=' + d.bytesPerCall +
+      ' culled=' + d.culled +
       ' (rules ' + JSON.stringify(RULES) + ')\n');
     for (const v of b.report.violations) {
-      process.stderr.write('  violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
+      process.stderr.write('  violation phaseB ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
+    }
+    for (const v of d.report.violations) {
+      process.stderr.write('  violation phaseD ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
     }
   }
   if (!controlOk) {

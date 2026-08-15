@@ -9,6 +9,13 @@ export const TAU: number;
 /** Package version string. */
 export const version: string;
 
+/**
+ * The @zakkster/lite-aabb packed-format contract version, re-exported. The
+ * per-node screen-box lane and the once-per-frame scene-bbox merge depend on the
+ * [minX,minY,maxX,maxY] float32x4 layout being format 1; createStage asserts it.
+ */
+export const FORMAT_VERSION: number;
+
 /** Node flag namespace (lite-fastbit32 BitMapper). Bit names below. */
 export const FLAGS: {
   get(name: FlagName): number;
@@ -94,6 +101,12 @@ export interface CameraOptions {
 export interface StageStats {
   facesDrawn: number;
   facesCulled: number;
+  /**
+   * Nodes rejected by EITHER the coarse depth/frustum reject OR the v1.5.0
+   * per-node screen-space AABB cull. A screen-box-culled node runs ZERO face-loop
+   * iterations, so its faces are NOT counted in facesCulled -- the v1.5.0 semantics
+   * shift (previously every off-screen face was tallied in facesCulled).
+   */
   nodesCulled: number;
   drawCalls: number;
   tTransform: number;
@@ -148,6 +161,22 @@ export interface Stage {
   readonly camera: Camera;
   readonly stats: StageStats;
   width: number; height: number; dpr: number;
+  /**
+   * Opt-in dirty-rect lane (default false). When true, each drawn node's screen
+   * AABB is stored and merged into `sceneBox` once per frame for incremental
+   * canvas redraw; the previous frame's union is kept in `prevSceneBox` for a
+   * delta. OFF => zero added hot cost (no per-node box write, no merge). The
+   * per-node screen-space cull itself is ALWAYS on, independent of this flag.
+   */
+  dirtyRect: boolean;
+  /**
+   * Union of this frame's drawn node screen boxes as a packed lite-aabb
+   * Float32Array[4] `[minX, minY, maxX, maxY]` (read-only). The canonical empty
+   * box `[Inf, Inf, -Inf, -Inf]` until `dirtyRect` is enabled and a frame runs.
+   */
+  readonly sceneBox: Float32Array;
+  /** The previous frame's `sceneBox` union (read-only), for a redraw delta. */
+  readonly prevSceneBox: Float32Array;
   /** Normalized directional light (xyz, Float64). */
   readonly light: Float64Array;
   /** Optional external 2D view transform (Float64Array[6]) applied once per frame (lite-camera hook). */

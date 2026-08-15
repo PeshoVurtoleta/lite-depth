@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.4.0
+# @zakkster/lite-depth v1.5.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -22,8 +22,12 @@ Optional cold-path peers: lite-signal (DI), lite-raf, lite-clock, lite-sprite-ca
 ## Import
 
     import { createStage, geometry, material, materialFromRamp,
-             createCamera, updateCamera, mathKernels, FLAGS, TAU, version }
+             createCamera, updateCamera, mathKernels, FLAGS, TAU,
+             version, FORMAT_VERSION }
       from '@zakkster/lite-depth';
+FORMAT_VERSION re-exports @zakkster/lite-aabb's packed-format contract version
+(the [minX,minY,maxX,maxY] float32x4 layout the node-box lane + scene-bbox merge
+depend on). createStage asserts it === 1 and throws if the peer ever drifts.
 
 ## createStage(ctx, opts) -> Stage
 
@@ -97,6 +101,12 @@ matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
     const s = stage.frame(dt);
     // s = { facesDrawn, facesCulled, nodesCulled, drawCalls,
     //       tTransform, tProject, tSort, tPaint,          (ms for the t* fields)
+    //       nodesCulled,       // nodes rejected by EITHER the coarse depth/frustum
+    //                          // reject OR the v1.5.0 per-node screen-space AABB
+    //                          // cull. A screen-box-culled node runs ZERO face-loop
+    //                          // iterations, so its faces are NOT in facesCulled --
+    //                          // that is the v1.5.0 semantics shift (was: every
+    //                          // off-screen face counted in facesCulled).
     //       facesOverflowed,   // nodes skipped by the vert/draw-face overflow door
     //       nodesInvalid,      // nodes rejected by the fail-closed collect door:
     //                          // a non-finite (NaN/Inf) pose lane, centroid, radius
@@ -106,6 +116,29 @@ matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
     //                          // inverse-transpose too but are not counted here
     //       nodesOrphaned,     // nodes whose dead parent forced a ROOT reparent
     //       nodesTotal }       // live node count this frame
+
+## Per-node screen cull + dirty-rect (v1.5.0)
+
+Each visible node builds a screen-space AABB over its FRONT-OF-NEAR verts (z<=-near)
+during projection. If that box misses the viewport the whole node is culled
+(nodesCulled +1, zero face-loop work). Two deliberately OPPOSITE doors:
+- face-bound NaN in the per-face viewport test -> the face is CULLED (fail CLOSED;
+  losing a degenerate face is safe).
+- an empty/non-finite node box (all verts behind near) -> the node is DRAWN, never
+  node-culled (fail OPEN; a wrongly-fired geometry cull loses picture). Its faces
+  are then rejected by the per-face near door, byte-identical to v1.4.0.
+
+    stage.dirtyRect = true;     // OPT-IN (default false). When on, each drawn node's
+                                // screen box is stored and merged once per frame.
+                                // OFF => zero added hot cost (no nodeBox write, no
+                                // merge). The screen-cull itself is ALWAYS on.
+    stage.sceneBox              // getter: Float32Array[4] [minX,minY,maxX,maxY], the
+                                // union of this frame's drawn node boxes (canonical
+                                // empty box until dirtyRect is enabled + a frame runs)
+    stage.prevSceneBox          // getter: the previous frame's union, for a redraw
+                                // delta (repaint sceneBox U prevSceneBox)
+Bounds are rounded OUTWARD to f32 so the stored box never clips the true box.
+Grown in lockstep by stage.reserve(n).
 
 ## Camera
 
