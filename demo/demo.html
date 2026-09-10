@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>lite-depth · zero-GC Canvas2D 3D · Zdog allocates, this doesn't</title>
+    <title>lite-depth - zero-GC Canvas2D 3D - Zdog allocates, this doesn't</title>
     <style>
         :root {
             --bg: #05070a;
@@ -165,6 +165,12 @@
             touch-action: pan-y pinch-zoom;
         }
 
+        canvas.overlay {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+        }
+
         .hint {
             position: absolute;
             left: 0.75rem;
@@ -310,6 +316,7 @@
 
         @media (width < 60rem
 
+
         ) {
             main {
                 grid-template-columns: minmax(0, 1fr);
@@ -325,7 +332,7 @@
 <div class="shell">
     <header>
         <h1>lite-depth</h1>
-        <span class="pkg">zero-GC Canvas2D software-projected 3D · <b>@zakkster/lite-arena</b> · <b>lite-fastbit32</b> · <b>lite-aabb</b></span>
+        <span class="pkg">zero-GC Canvas2D software-projected 3D - <b>@zakkster/lite-arena</b> - <b>lite-fastbit32</b> - <b>lite-aabb</b></span>
         <span class="tag">0 bytes / frame</span>
     </header>
 
@@ -333,6 +340,9 @@
         <button data-tab="gallery" aria-current="true"><span class="scene-num">01</span>Primitive Gallery</button>
         <button data-tab="stress"><span class="scene-num">02</span>Zero-GC Stress Field</button>
         <button data-tab="zbias"><span class="scene-num">03</span>Z-Bias / Layer</button>
+        <button data-tab="wire"><span class="scene-num">04</span>Wireframe / Stroke</button>
+        <button data-tab="hier"><span class="scene-num">05</span>Hierarchy Lighting</button>
+        <button data-tab="cull"><span class="scene-num">06</span>Cull + DirtyRect</button>
     </nav>
 
     <main>
@@ -340,71 +350,87 @@
             <section class="scene" data-scene="gallery" data-active>
                 <div class="stage">
                     <canvas id="gallery-canvas"></canvas>
-                    <span class="hint">drag to orbit · box · sphere · cylinder · cone · plane · polyline</span></div>
+                    <span class="hint">drag to orbit - box - sphere - cylinder - cone - plane - polyline</span></div>
             </section>
             <section class="scene" data-scene="stress">
                 <div class="stage">
                     <canvas id="stress-canvas"></canvas>
-                    <span class="hint">drag to orbit · every node re-oriented every frame</span></div>
+                    <span class="hint">drag to orbit - every node re-oriented every frame</span></div>
             </section>
             <section class="scene" data-scene="zbias">
                 <div class="stage">
                     <canvas id="zbias-canvas"></canvas>
-                    <span class="hint">two interpenetrating slabs · painter popping vs the packed sort key</span></div>
+                    <span class="hint">two interpenetrating slabs - painter popping vs the packed sort key</span></div>
+            </section>
+            <section class="scene" data-scene="wire">
+                <div class="stage">
+                    <canvas id="wire-canvas"></canvas>
+                    <span class="hint">drag to orbit - wireframe / fill-then-outline / fill:false (invisible)</span></div>
+            </section>
+            <section class="scene" data-scene="hier">
+                <div class="stage">
+                    <canvas id="hier-canvas"></canvas>
+                    <span class="hint">drag to orbit - non-uniform parent, uniform child, world-normal light</span></div>
+            </section>
+            <section class="scene" data-scene="cull">
+                <div class="stage">
+                    <canvas id="cull-canvas"></canvas>
+                    <canvas id="cull-overlay" class="overlay"></canvas>
+                    <span class="hint">drag to orbit - nodes orbit off-screen - toggle dirtyRect for the merged box</span></div>
             </section>
         </div>
 
         <aside class="panel" id="panel">
             <!-- gallery controls -->
             <div data-panel="gallery">
-                <div class="panel-head">scene 01 · projection + shading</div>
+                <div class="panel-head">scene 01 - projection + shading</div>
                 <h3>light direction</h3>
-                <div class="ctl"><label>azimuth <b id="g-azV">—</b></label><input type="range" id="g-az" min="0"
+                <div class="ctl"><label>azimuth <b id="g-azV">-</b></label><input type="range" id="g-az" min="0"
                                                                                   max="360" value="45"></div>
-                <div class="ctl"><label>elevation <b id="g-elV">—</b></label><input type="range" id="g-el" min="-80"
+                <div class="ctl"><label>elevation <b id="g-elV">-</b></label><input type="range" id="g-el" min="-80"
                                                                                     max="80" value="40"></div>
                 <div class="row">
                     <button id="g-auto" aria-pressed="true">auto-orbit</button>
                 </div>
                 <div class="tele">
-                    <span>faces drawn</span><span id="g-fd" class="hi">—</span>
-                    <span>back-face culled</span><span id="g-fc">—</span>
-                    <span>draw calls (style-runs)</span><span id="g-dc">—</span>
+                    <span>faces drawn</span><span id="g-fd" class="hi">-</span>
+                    <span>back-face culled</span><span id="g-fc">-</span>
+                    <span>draw calls (style-runs)</span><span id="g-dc">-</span>
                 </div>
                 <div class="note">Six primitives, one <b>painter pass</b>. Flat per-face shading via a pre-baked
-                    fillStyle LUT — no per-frame string building.
+                    fillStyle LUT -- no per-frame string building.
                 </div>
             </div>
 
             <!-- stress controls -->
             <div data-panel="stress" hidden>
-                <div class="panel-head">scene 02 · the whole pitch</div>
+                <div class="panel-head">scene 02 - the whole pitch</div>
                 <h3>node count</h3>
-                <div class="ctl"><label>nodes <b id="s-nV">—</b></label><input type="range" id="s-n" min="200"
+                <div class="ctl"><label>nodes <b id="s-nV">-</b></label><input type="range" id="s-n" min="200"
                                                                                max="8000" step="100" value="3000"></div>
-                <div class="badge">frame path: <b>0 B/frame · 0 GC</b><br>proven by lite-gc-profiler</div>
+                <div class="badge">frame path: <b>0 B/frame - 0 GC</b><br>proven by lite-gc-profiler</div>
                 <canvas class="spark" id="s-spark" width="512" height="96"></canvas>
                 <div class="tele">
-                    <span>faces drawn</span><span id="s-fd" class="hi">—</span>
-                    <span>faces culled</span><span id="s-fc">—</span>
-                    <span>nodes frustum-cut</span><span id="s-nc">—</span>
-                    <span>frame time</span><span id="s-ft" class="hi">—</span>
-                    <span>fps</span><span id="s-fps">—</span>
-                    <span>transform</span><span id="s-tt">—</span>
-                    <span>project</span><span id="s-tp">—</span>
-                    <span>sort</span><span id="s-ts">—</span>
-                    <span>paint</span><span id="s-tpaint">—</span>
+                    <span>faces drawn</span><span id="s-fd" class="hi">-</span>
+                    <span>faces culled</span><span id="s-fc">-</span>
+                    <span>nodes frustum-cut</span><span id="s-nc">-</span>
+                    <span>frame time</span><span id="s-ft" class="hi">-</span>
+                    <span>fps</span><span id="s-fps">-</span>
+                    <span>transform</span><span id="s-tt">-</span>
+                    <span>project</span><span id="s-tp">-</span>
+                    <span>sort</span><span id="s-ts">-</span>
+                    <span>paint</span><span id="s-tpaint">-</span>
                 </div>
-                <div class="note">Every node dirty every frame — worst case for transform + project + radix sort +
+                <div class="note">Every node dirty every frame -- worst case for transform + project + radix sort +
                     paint. Allocation stays at <b>zero</b> regardless of count.
                 </div>
             </div>
 
             <!-- zbias controls -->
             <div data-panel="zbias" hidden>
-                <div class="panel-head">scene 03 · the escape hatch</div>
+                <div class="panel-head">scene 03 - the escape hatch</div>
                 <h3>packed sort key</h3>
-                <div class="ctl"><label>depth bias (red slab) <b id="z-bV">—</b></label><input type="range" id="z-b"
+                <div class="ctl"><label>depth bias (red slab) <b id="z-bV">-</b></label><input type="range" id="z-b"
                                                                                                min="-8" max="8"
                                                                                                step="0.1" value="0">
                 </div>
@@ -416,11 +442,74 @@
                 </div>
                 <div class="tele">
                     <span>red key layer</span><span id="z-lay" class="hi">0</span>
-                    <span>faces drawn</span><span id="z-fd">—</span>
+                    <span>faces drawn</span><span id="z-fd">-</span>
                 </div>
                 <div class="note">Centroid depth-sort pops on interpenetrating meshes. A per-node <b>depthBias</b>
-                    nudges the quantized key; a <b>layer</b> bit forces ordering outright — one mechanism, both fixes,
+                    nudges the quantized key; a <b>layer</b> bit forces ordering outright -- one mechanism, both fixes,
                     zero sort cost.
+                </div>
+            </div>
+
+            <!-- wireframe controls -->
+            <div data-panel="wire" hidden>
+                <div class="panel-head">scene 04 - fill / stroke matrix</div>
+                <h3>material.fill vs stroke</h3>
+                <div class="row">
+                    <button id="w-auto" aria-pressed="true">auto-orbit</button>
+                </div>
+                <div class="tele">
+                    <span>faces drawn</span><span id="w-fd" class="hi">-</span>
+                    <span>draw calls (style-runs)</span><span id="w-dc">-</span>
+                </div>
+                <div class="note">Three materials, pre-registered at init. Left: <b>fill:false + stroke</b> (wireframe).
+                    Middle: <b>fill:true + stroke</b> (fill-then-outline). Right: <b>fill:false</b> alone draws nothing
+                    -- the v1.4.0 honoured-fill contract, made visible by its absence.
+                </div>
+            </div>
+
+            <!-- hierarchy controls -->
+            <div data-panel="hier" hidden>
+                <div class="panel-head">scene 05 - world-normal lighting</div>
+                <h3>rotated + non-uniform parent</h3>
+                <div class="row">
+                    <button id="h-auto" aria-pressed="true">auto-orbit</button>
+                </div>
+                <div class="tele">
+                    <span>nodes non-uniform</span><span id="h-nu" class="hi">-</span>
+                    <span>faces drawn</span><span id="h-fd">-</span>
+                    <span>live nodes</span><span id="h-nt">-</span>
+                </div>
+                <div class="note">The parent has a <b>non-uniform local scale</b> (2.1 x 0.6 x 1.0) and spins; the
+                    uniform child inherits its <b>world</b> matrix. Shading follows the world normal (inverse-transpose),
+                    not the local quaternion -- the child stays correctly lit. <b>nodesNonUniform</b> counts the parent
+                    only; the inherited-non-uniform child is shaded the same way but not tallied.
+                </div>
+            </div>
+
+            <!-- cull + dirtyRect controls -->
+            <div data-panel="cull" hidden>
+                <div class="panel-head">scene 06 - screen cull + dirty rect</div>
+                <h3>per-node screen-space AABB</h3>
+                <div class="row">
+                    <button id="c-dirty" aria-pressed="false">dirtyRect overlay</button>
+                    <button id="c-auto" aria-pressed="true">auto-orbit</button>
+                </div>
+                <div class="row">
+                    <button id="c-reload">clear + rebuild</button>
+                    <button id="c-reserve">reserve +32</button>
+                </div>
+                <div class="tele">
+                    <span>nodes culled</span><span id="c-nc" class="hi">-</span>
+                    <span>faces culled</span><span id="c-fc">-</span>
+                    <span>faces drawn</span><span id="c-fd">-</span>
+                    <span>remaining slots</span><span id="c-rem">-</span>
+                    <span>structure epoch</span><span id="c-epoch">-</span>
+                </div>
+                <div class="note">Nodes orbit off-screen: a whole node whose projected box misses the viewport is
+                    <b>node-culled</b> (its faces run zero loop iterations, so they leave <b>facesCulled</b> and land in
+                    <b>nodesCulled</b>). Toggle <b>dirtyRect</b> (default off) to stroke the amber union of
+                    <b>sceneBox</b> and <b>prevSceneBox</b>, read in place from the getters -- the incremental-redraw
+                    delta.
                 </div>
             </div>
         </aside>
@@ -431,9 +520,10 @@
 {
   "imports": {
     "@zakkster/lite-depth": "../Depth.js",
-    "@zakkster/lite-arena": "https://esm.sh/@zakkster/lite-arena@1.0.1",
-    "@zakkster/lite-fastbit32": "https://esm.sh/@zakkster/lite-fastbit32@1.2.0",
-    "@zakkster/lite-aabb": "https://esm.sh/@zakkster/lite-aabb@1.0.0"
+    "@zakkster/lite-arena": "https://esm.sh/@zakkster/lite-arena@1.9",
+    "@zakkster/lite-fastbit32": "https://esm.sh/@zakkster/lite-fastbit32@1.2",
+    "@zakkster/lite-aabb": "https://esm.sh/@zakkster/lite-aabb@2",
+    "@zakkster/lite-layout-profiler": "https://esm.sh/@zakkster/lite-layout-profiler@1"
   }
 }
 
@@ -442,7 +532,7 @@
 <script type="module">
     import {createStage, geometry, material, updateCamera, TAU} from '@zakkster/lite-depth';
 
-    /* ── cached DOM refs (all lookups at init) ── */
+    /* ---- cached DOM refs (all lookups at init) ---- */
     const $tabs = document.getElementById('tabs');
     const $panels = document.querySelectorAll('[data-panel]');
     const $scenes = document.querySelectorAll('[data-scene]');
@@ -468,7 +558,24 @@
     const $zLayer = document.getElementById('z-layer'), $zAuto = document.getElementById('z-auto');
     const $zLay = document.getElementById('z-lay'), $zFd = document.getElementById('z-fd');
 
-    /* ── throttled textContent write (only touches the DOM on change) ── */
+    const $wCanvas = document.getElementById('wire-canvas');
+    const $wAuto = document.getElementById('w-auto');
+    const $wFd = document.getElementById('w-fd'), $wDc = document.getElementById('w-dc');
+
+    const $hCanvas = document.getElementById('hier-canvas');
+    const $hAuto = document.getElementById('h-auto');
+    const $hNu = document.getElementById('h-nu'), $hFd = document.getElementById('h-fd'),
+        $hNt = document.getElementById('h-nt');
+
+    const $cCanvas = document.getElementById('cull-canvas');
+    const $cOverlay = document.getElementById('cull-overlay'), $cOverlayCtx = $cOverlay.getContext('2d');
+    const $cDirty = document.getElementById('c-dirty'), $cAuto = document.getElementById('c-auto');
+    const $cReload = document.getElementById('c-reload'), $cReserve = document.getElementById('c-reserve');
+    const $cNc = document.getElementById('c-nc'), $cFc = document.getElementById('c-fc'),
+        $cFd = document.getElementById('c-fd');
+    const $cRem = document.getElementById('c-rem'), $cEpoch = document.getElementById('c-epoch');
+
+    /* ---- throttled textContent write (only touches the DOM on change) ---- */
     const hud = ($el, v) => {
         if ($el._v !== v) {
             $el._v = v;
@@ -479,19 +586,32 @@
     const f2 = (x) => (Math.round(x * 100) / 100).toFixed(2);
     const fmtN = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : '' + n;
 
-    /* ── shared canvas sizing (cold) ── */
+    /* ---- one ResizeObserver writes cached integer size per canvas (no per-frame
+       getBoundingClientRect). The rAF loop reads only these ints -- kills the
+       read-before-paint forced reflow. contentRect is supplied by the observer, so
+       reading it here is not a layout read we force. ---- */
+    const ro = new ResizeObserver((entries) => {
+        for (let i = 0; i < entries.length; i++) {
+            const e = entries[i], cr = e.contentRect, t = e.target;
+            t.__cw = Math.max(1, Math.round(cr.width));
+            t.__ch = Math.max(1, Math.round(cr.height));
+        }
+    });
+
+    /* ---- shared canvas sizing (reads cached ints only, never layout) ---- */
     function fit(canvas, stage) {
-        const r = canvas.getBoundingClientRect();
+        const w = canvas.__cw | 0, h = canvas.__ch | 0;
+        if (w === 0 || h === 0) return;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
-        if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-            canvas.width = w * dpr;
-            canvas.height = h * dpr;
+        const cw = w * dpr | 0, ch = h * dpr | 0;
+        if (canvas.width !== cw || canvas.height !== ch) {
+            canvas.width = cw;
+            canvas.height = ch;
             stage.resize(w, h, dpr);
         }
     }
 
-    /* ── drag-orbit, implemented inline per demo JS rules (no camera dep in core) ── */
+    /* ---- drag-orbit, implemented inline per demo JS rules (no camera dep in core) ---- */
     function attachOrbit(canvas, cam, state) {
         let dragging = false, lx = 0, ly = 0;
         canvas.addEventListener('pointerdown', (e) => {
@@ -517,7 +637,7 @@
         });
     }
 
-    /* ═══════════ scene 01 · primitive gallery ═══════════ */
+    /* =========== scene 01 - primitive gallery =========== */
     const gStage = createStage($gCanvas.getContext('2d'), {
         width: 800,
         height: 512,
@@ -571,7 +691,7 @@
         }
     }
 
-    /* ═══════════ scene 02 · zero-GC stress field ═══════════ */
+    /* =========== scene 02 - zero-GC stress field =========== */
     const S_MAX = 8000;
     const sStage = createStage($sCanvas.getContext('2d'), {
         width: 800,
@@ -670,7 +790,7 @@
         c.stroke();
     }
 
-    /* ═══════════ scene 03 · z-bias / layer playground ═══════════ */
+    /* =========== scene 03 - z-bias / layer playground =========== */
     const zStage = createStage($zCanvas.getContext('2d'), {
         width: 800,
         height: 512,
@@ -705,13 +825,193 @@
         }
     }
 
-    /* ── scene registry + single rAF loop ── */
+    /* =========== scene 04 - wireframe / stroke matrix ===========
+       All three materials are pre-registered here; no material() call ever runs in
+       a handler or a frame body. */
+    const wStage = createStage($wCanvas.getContext('2d'), {
+        width: 800,
+        height: 512,
+        maxNodes: 8,
+        maxVerts: 2048,
+        maxDrawFaces: 2048,
+        camera: {radius: 8.5, theta: 0.6, phi: 1.05, near: 0.1, far: 60}
+    });
+    const wGeo = wStage.geometry(geometry.sphere(0.95, 14, 10));
+    const wMatWire = wStage.material(material({r: 95, g: 227, b: 161, fill: false, stroke: '#5fe3a1', lineWidth: 1.4}));
+    const wMatFillOutline = wStage.material(material({r: 79, g: 217, b: 232, ambient: 0.34, fill: true, stroke: '#05070a', lineWidth: 1.4}));
+    const wMatNoFill = wStage.material(material({r: 232, g: 107, b: 208, fill: false}));
+    const wNodes = [
+        wStage.addNode(wGeo, wMatWire, {x: -2.7, y: 0, z: 0}),
+        wStage.addNode(wGeo, wMatFillOutline, {x: 0, y: 0, z: 0}),
+        wStage.addNode(wGeo, wMatNoFill, {x: 2.7, y: 0, z: 0}),
+    ];
+    const wState = {
+        auto: true, onManual() {
+            $wAuto.setAttribute('aria-pressed', 'false');
+        }
+    };
+    attachOrbit($wCanvas, wStage.camera, wState);
+
+    function wireFrame(dt, f) {
+        if (wState.auto) {
+            wStage.camera.theta += dt * 0.00016;
+            updateCamera(wStage.camera);
+        }
+        const spin = f * 0.01;
+        for (let i = 0; i < 3; i++) wStage.setEuler(wNodes[i], spin * 0.6, spin, 0);
+        const s = wStage.frame(dt);
+        if ((f & 7) === 0) {
+            hud($wFd, s.facesDrawn);
+            hud($wDc, s.drawCalls);
+        }
+    }
+
+    /* =========== scene 05 - hierarchy / world-normal lighting ===========
+       Non-uniform, rotated parent with a uniform child. setParent is cold -- called
+       once here at setup, never per frame. */
+    const hStage = createStage($hCanvas.getContext('2d'), {
+        width: 800,
+        height: 512,
+        maxNodes: 8,
+        maxVerts: 2048,
+        maxDrawFaces: 2048,
+        camera: {radius: 9.5, theta: 0.7, phi: 1.02, near: 0.1, far: 60}
+    });
+    const hParentGeo = hStage.geometry(geometry.box(1.6, 1.6, 1.6));
+    const hChildGeo = hStage.geometry(geometry.box(0.9, 0.9, 0.9));
+    const hMatParent = hStage.material(material({r: 232, g: 180, b: 95, ambient: 0.3}));
+    const hMatChild = hStage.material(material({r: 79, g: 217, b: 232, ambient: 0.3}));
+    const hParent = hStage.addNode(hParentGeo, hMatParent, {x: 0, y: 0, z: 0});
+    const hChild = hStage.addNode(hChildGeo, hMatChild, {x: 0, y: 1.7, z: 0});
+    hStage.setScale(hParent, 2.1, 0.6, 1.0);    // NON-uniform local scale (cold)
+    hStage.setScale(hChild, 0.85);              // uniform child (cold)
+    hStage.setParent(hChild, hParent);          // cold topo rebuild, setup only
+    const hState = {
+        auto: true, onManual() {
+            $hAuto.setAttribute('aria-pressed', 'false');
+        }
+    };
+    attachOrbit($hCanvas, hStage.camera, hState);
+
+    function hierFrame(dt, f) {
+        if (hState.auto) {
+            hStage.camera.theta += dt * 0.00016;
+            updateCamera(hStage.camera);
+        }
+        const spin = f * 0.008;
+        hStage.setEuler(hParent, spin * 0.4, spin, spin * 0.2);
+        const s = hStage.frame(dt);
+        if ((f & 7) === 0) {
+            hud($hNu, s.nodesNonUniform);
+            hud($hFd, s.facesDrawn);
+            hud($hNt, s.nodesTotal);
+        }
+    }
+
+    /* =========== scene 06 - screen cull + opt-in dirty rect ===========
+       Nodes orbit through and off the viewport so nodesCulled moves. dirtyRect is
+       OFF by default; when on, the overlay strokes sceneBox U prevSceneBox read in
+       place from the getters (no array copy, no alloc per frame). */
+    const C_N = 48, C_CAP = 64;
+    const cStage = createStage($cCanvas.getContext('2d'), {
+        width: 800,
+        height: 512,
+        maxNodes: C_CAP,
+        maxVerts: C_CAP * 8,
+        maxDrawFaces: C_CAP * 6,
+        camera: {radius: 15, theta: 0.6, phi: 1.05, near: 0.5, far: 120}
+    });
+    const cBox = cStage.geometry(geometry.box(1, 1, 1));
+    const cMat = [
+        cStage.material(material({r: 95, g: 227, b: 161, ambient: 0.3})),
+        cStage.material(material({r: 79, g: 217, b: 232, ambient: 0.3})),
+        cStage.material(material({r: 232, g: 180, b: 95, ambient: 0.3})),
+    ];
+    const cNodes = new Array(C_N);
+    const cRad = new Float64Array(C_N);
+    const cPhase = new Float64Array(C_N);
+
+    /* cold: (re)populate the cull stage's nodes (used at boot and after clear()) */
+    function buildCull() {
+        for (let i = 0; i < C_N; i++) {
+            cRad[i] = 6 + (i % 8) * 1.7;
+            cPhase[i] = (i * 2.39996) % TAU;
+            cNodes[i] = cStage.addNode(cBox, cMat[i % 3], {x: 0, y: 0, z: 0});
+        }
+    }
+
+    buildCull();
+    const cState = {
+        auto: true, onManual() {
+            $cAuto.setAttribute('aria-pressed', 'false');
+        }
+    };
+    attachOrbit($cCanvas, cStage.camera, cState);
+
+    function cullFrame(dt, f, now) {
+        if (cState.auto) {
+            cStage.camera.theta += dt * 0.00014;
+            updateCamera(cStage.camera);
+        }
+        const t = now * 0.00035;
+        for (let i = 0; i < C_N; i++) {
+            const a = cPhase[i] + t, r = cRad[i];
+            cStage.setPosition(cNodes[i], Math.cos(a) * r, Math.sin(a * 1.3) * r * 0.5, Math.sin(a) * r);
+        }
+        const s = cStage.frame(dt);
+        drawCullOverlay();
+        if ((f & 7) === 0) {
+            hud($cNc, s.nodesCulled);
+            hud($cFc, s.facesCulled);
+            hud($cFd, s.facesDrawn);
+        }
+    }
+
+    /* overlay: stroke the merged scene box in place from the getters (no alloc) */
+    function drawCullOverlay() {
+        const w = $cOverlay.__cw | 0, h = $cOverlay.__ch | 0;
+        if (w === 0 || h === 0) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const cw = w * dpr | 0, ch = h * dpr | 0;
+        if ($cOverlay.width !== cw || $cOverlay.height !== ch) {
+            $cOverlay.width = cw;
+            $cOverlay.height = ch;
+        }
+        const oc = $cOverlayCtx;
+        oc.setTransform(dpr, 0, 0, dpr, 0, 0);
+        oc.clearRect(0, 0, w, h);
+        if (cStage.dirtyRect !== true) return;
+        const a = cStage.sceneBox, b = cStage.prevSceneBox;
+        let minx = a[0], miny = a[1], maxx = a[2], maxy = a[3];
+        if (b[0] < minx) minx = b[0];
+        if (b[1] < miny) miny = b[1];
+        if (b[2] > maxx) maxx = b[2];
+        if (b[3] > maxy) maxy = b[3];
+        if (!(maxx > minx) || !(maxy > miny)) return;   // canonical-empty box (also rejects NaN)
+        oc.strokeStyle = '#e8b45f';
+        oc.lineWidth = 1.5;
+        oc.strokeRect(minx, miny, maxx - minx, maxy - miny);
+    }
+
+    /* ---- scene registry + single rAF loop ---- */
     const scenes = {
         gallery: {stage: gStage, canvas: $gCanvas, frame: galleryFrame},
         stress: {stage: sStage, canvas: $sCanvas, frame: stressFrame},
         zbias: {stage: zStage, canvas: $zCanvas, frame: zbiasFrame},
+        wire: {stage: wStage, canvas: $wCanvas, frame: wireFrame},
+        hier: {stage: hStage, canvas: $hCanvas, frame: hierFrame},
+        cull: {stage: cStage, canvas: $cCanvas, frame: cullFrame},
     };
     let active = 'gallery', frameN = 0, last = performance.now();
+
+    /* observe every stage canvas (+ the cull overlay) once, at init */
+    ro.observe($gCanvas);
+    ro.observe($sCanvas);
+    ro.observe($zCanvas);
+    ro.observe($wCanvas);
+    ro.observe($hCanvas);
+    ro.observe($cCanvas);
+    ro.observe($cOverlay);
 
     function loop(now) {
         const dt = now - last;
@@ -723,7 +1023,7 @@
         requestAnimationFrame(loop);
     }
 
-    /* ── controls (cold path) ── */
+    /* ---- controls (cold path) ---- */
     function setLight(stage, azDeg, elDeg) {
         const az = azDeg * Math.PI / 180, el = elDeg * Math.PI / 180, ce = Math.cos(el);
         const L = stage.light;
@@ -737,8 +1037,8 @@
     }
 
     const applyGalleryLight = () => {
-        hud($gAzV, $gAz.value + '°');
-        hud($gElV, $gEl.value + '°');
+        hud($gAzV, $gAz.value + ' deg');
+        hud($gElV, $gEl.value + ' deg');
         setLight(gStage, +$gAz.value, +$gEl.value);
     };
     $gAz.addEventListener('input', applyGalleryLight);
@@ -768,7 +1068,43 @@
         $zAuto.setAttribute('aria-pressed', String(zState.auto));
     });
 
-    /* ── tabs ── */
+    $wAuto.addEventListener('click', () => {
+        wState.auto = !wState.auto;
+        $wAuto.setAttribute('aria-pressed', String(wState.auto));
+    });
+
+    $hAuto.addEventListener('click', () => {
+        hState.auto = !hState.auto;
+        $hAuto.setAttribute('aria-pressed', String(hState.auto));
+    });
+
+    /* cull scene: dirtyRect toggle (default off), orbit toggle, and the cold
+       clear()/reserve() scene-reload panel driving remainingNodes / structureEpoch */
+    function updateCullReadouts() {
+        hud($cRem, cStage.remainingNodes);
+        hud($cEpoch, cStage.structureEpoch);
+    }
+
+    $cDirty.addEventListener('click', () => {
+        cStage.dirtyRect = !cStage.dirtyRect;
+        $cDirty.setAttribute('aria-pressed', String(cStage.dirtyRect));
+    });
+    $cAuto.addEventListener('click', () => {
+        cState.auto = !cState.auto;
+        $cAuto.setAttribute('aria-pressed', String(cState.auto));
+    });
+    $cReload.addEventListener('click', () => {
+        cStage.clear();       // invalidates every prior handle; keeps geometry + material
+        buildCull();          // re-mints C_N fresh handles into cNodes
+        updateCullReadouts();
+    });
+    $cReserve.addEventListener('click', () => {
+        const cap = cStage.remainingNodes + C_N;   // live count is always C_N
+        cStage.reserve(cap + 32);                  // grow node-capacity lanes (cold)
+        updateCullReadouts();
+    });
+
+    /* ---- tabs ---- */
     $tabs.addEventListener('click', (e) => {
         const btn = e.target.closest('button');
         if (!btn) return;
@@ -780,13 +1116,27 @@
         for (const p of $panels) p.hidden = p.dataset.panel !== active;
     });
 
-    /* ── hook initial UI values from state, then start ── */
+    /* ---- hook initial UI values from state, then start ---- */
     hud($sNV, fmtN(sCount));
     hud($zBV, f1(0));
     applyGalleryLight();
+    updateCullReadouts();
     requestAnimationFrame(loop);
 
-    /* ── helpers ── */
+    /* ---- #profile: dev-only forced-reflow gate (dormant unless the hash asks) ----
+       Dynamically imports @zakkster/lite-layout-profiler ONLY at location.hash
+       '#profile', stores the handle on window.__layout, and tears it down on unload.
+       Never in package.json files[]; a normal load never fetches it. */
+    if (location.hash === '#profile') {
+        import('@zakkster/lite-layout-profiler').then((m) => {
+            window.__layout = m.createLayoutProfiler();
+        }).catch(() => {});
+        window.addEventListener('unload', () => {
+            if (window.__layout) window.__layout.destroy();
+        });
+    }
+
+    /* ---- helpers ---- */
     function spiral(rInner, height, segs) {
         const pts = [];
         for (let i = 0; i <= segs; i++) {

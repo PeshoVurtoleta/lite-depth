@@ -959,4 +959,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.5.0';
+export const version = '1.5.1';

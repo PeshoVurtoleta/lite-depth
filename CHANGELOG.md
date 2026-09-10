@@ -4,6 +4,64 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Demo-only changes. The `demo/` directory ships in neither `package.json` `files[]`
+nor the npm tarball, so the published library surface is unchanged at 1.5.0. This
+brings both demos current with the v1.3.0-v1.5.0 feature surface and hardens their
+frame loops against forced synchronous reflow (the zero-byte, zero-GC failure mode
+the torture gate is structurally blind to).
+
+### Changed
+
+- **Demo importmap repinned** to the installed peers (`@zakkster/lite-aabb` 2.x,
+  `@zakkster/lite-arena` 1.9, `@zakkster/lite-fastbit32` 1.2). `demo/demo.html` was
+  still pinned to `lite-aabb@1.0.0`, whose missing `FORMAT_VERSION` tripped the
+  `createStage` `FORMAT_VERSION === 1` assert added in 1.5.0 and stopped the demo
+  from booting.
+- **Eliminated per-frame forced reflow in the demo `fit()` paths.** Canvas size is
+  read once in a `ResizeObserver` callback and cached as integers; the rAF loop no
+  longer reads `getBoundingClientRect`/`clientWidth`/`clientHeight` per frame
+  (`demo/demo.html` and `demo/motion.html`).
+- **`demo/motion.html`** caches loop/rate/ease control values on `change` instead of
+  reading `.value` per frame, and adds a clock-vs-standalone-dt toggle, an ease-bank
+  select, and an explicit `quatKey` slerp track.
+
+### Added
+
+- **`demo/demo.html`: three new scenes** covering the v1.4.0-v1.5.0 surface --
+  Wireframe/Stroke (`fill:false + stroke` wireframe vs `fill:true + stroke`
+  fill-then-outline vs `fill:false` alone), Hierarchy Lighting (non-uniform rotated
+  parent + uniform child proving world-normal shading and `stats.nodesNonUniform`),
+  and Cull + DirtyRect (`stats.nodesCulled` vs `facesCulled` readouts, an opt-in
+  `stage.dirtyRect` toggle, and an overlay stroking `sceneBox` U `prevSceneBox`) --
+  plus a `clear()`/`reserve()` scene-reload panel reading `remainingNodes` and
+  `structureEpoch`.
+- **`#profile` dev gate.** With `location.hash === '#profile'` the demo dynamically
+  imports `@zakkster/lite-layout-profiler` for forced-reflow auditing and calls
+  `destroy()` on unload; a normal load never fetches it. Never in `files[]`.
+
+## [1.5.1] - 2026-08-31
+
+Test-harness hardening only. The published library surface (`Depth.js`) is byte-for-byte
+unchanged from 1.5.0; `test/` ships in neither `package.json` `files[]` nor the tarball.
+
+### Changed
+
+- **Phase A retention rebuilt on two oracles.** The prior gate tracked a throwaway
+  `{slot}`, then untracked it immediately, so its `size() === 0` was a tautology.
+  Phase A now asserts the arena conservation law per cycle (the node-slot oracle --
+  lite-depth is arena-backed SoA with no per-node JS object) alongside a
+  finalization-authority witness on the STAGE (the real JS object each cycle
+  allocates), tracked without untrack across fresh create/frame/despawn/drop cycles,
+  hard-settled, residual `<= RES` (16).
+
+### Added
+
+- **`DEPTH_TORTURE_LEAK=1` extended to trip both oracles.** The fault-injection path
+  now pins stages and skips removes, so both the arena-conservation oracle and the
+  stage finalization-authority witness fail closed under injected retention.
+
 ## [1.5.0] - 2026-08-15
 
 Per-node screen-space cull + opt-in dirty-rect (roadmap D3). The per-face viewport

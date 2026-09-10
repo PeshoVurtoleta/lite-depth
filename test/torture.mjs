@@ -10,15 +10,33 @@
  * self-controlling and trips die() (exit non-zero) on regression. On full pass
  * stdout is exactly "ok"; the GATE metrics line and all diagnostics go to stderr.
  *
- *   Phase A (retention) -- 4096 spawn/despawn cycles on a real stage. Every node
- *     spawned via stage.addNode() is paired with an external JS resource tracked
- *     by @zakkster/lite-leak; on removal the resource is untracked and the node
- *     despawned via stage.remove(). After EVERY cycle TWO independent witnesses
- *     must return to baseline: the arena's own pool accounting (the conservation
- *     law activeCount + retiredCount + remainingCapacity === capacity, AND
- *     activeCount === nodes.count === 0) and the lite-leak tracker.size(). Two
- *     oracles, so a bug in one cannot hide behind the other. Its control is
- *     DEPTH_TORTURE_LEAK=1: skip every remove() and both oracles stay non-zero.
+ *   Phase A (retention) -- 4096 stage build/tear-down cycles. Each cycle creates
+ *     a FRESH real stage, spawns N box nodes, drives one frame, despawns them all,
+ *     then drops the stage. TWO independent witnesses gate retention, and they
+ *     answer DIFFERENT questions:
+ *       1. Arena conservation (per cycle): the pool accounting law
+ *          activeCount + retiredCount + remainingCapacity === capacity, AND
+ *          activeCount === nodes.count === 0 after the despawns. This is the
+ *          genuine node-SLOT oracle -- lite-depth stores nodes in an arena of
+ *          typed-array (SoA) components, so there is NO per-node JS object to
+ *          finalize; a leaked node is a leaked arena slot, which is exactly what
+ *          this law catches.
+ *       2. Finalization residual (AUTHORITY, after the loop): the STAGE is the
+ *          real JS object a cycle allocates (its arena + frame buffers). Each
+ *          dropped stage is tracked with lite-leak WITHOUT untracking it (shared
+ *          NOOP cleanup + numeric tag capture NOTHING -- held-value contract), so
+ *          a stage that was truly released is collected (size--) and one retained
+ *          by a stray reference is not. After the loop we settle HARD (>= 10
+ *          gc()+tick passes) and assert tracker.size() <= RES = max(16, CYCLES/1000).
+ *     (An earlier version tracked a THROWAWAY { slot } per node and untracked it
+ *     the same cycle, asserting size()===0 -- a VACUOUS TAUTOLOGY: untrack
+ *     decrements the counter synchronously, netting to 0 even if the object were
+ *     retained forever, and it tracked a proxy rather than any real resource. The
+ *     arena law was the only genuine retention oracle; the lite-leak line added
+ *     nothing. Fixed here to witness the real stage object by finalization.)
+ *     Control DEPTH_TORTURE_LEAK=1: skip every remove() AND pin every stage in a
+ *     module sink -- the arena law reads activeCount>0 and the finalization
+ *     residual stays ~cycles, so BOTH oracles trip.
  *
  *   Phase B (GC budget / zero-alloc hot path) -- a dense stage of 2000 box nodes
  *     is pre-spawned to capacity and marked dirty OUTSIDE the measured loop, then
@@ -78,21 +96,42 @@ import { createLeakTracker } from '@zakkster/lite-leak';
 
 const CYCLES = 4096;        // Phase A create/dispose cycles
 const N = 8;                // nodes spawned+removed per cycle
+const STAGE_CAP = 64;       // per-cycle stage capacity (N spawns + slack)
 const DENSE = 2000;         // Phase B/C dense node population (to capacity)
 const HOT_FRAMES = 20000;   // Phase B measured frames
 const CTRL_FRAMES = 4000;   // Phase C control frames (retains per-face allocs)
-const INDEX_MASK = 0xFFFFF; // lite-arena low 20 bits = slot index (a primitive)
 const DT = 1 / 60;
+
+// Finalization residual ceiling for the Phase A stage witness. A cleanly dropped
+// stage is collected; a leaked one is not. Clean runs leave single digits; a
+// real leak leaves ~CYCLES.
+const RES = Math.max(16, (CYCLES / 1000) | 0); // 16
 
 const RULES = { maxMajor: 0, maxPauseMs: 4, maxArrayBuffersGrowth: 0 };
 
-// Skip every remove() -- the deliberately-leaky Phase A control. See header.
+// Skip every remove() AND pin every stage -- the deliberately-leaky Phase A
+// control. See header.
 const LEAK = process.env.DEPTH_TORTURE_LEAK === '1';
 
+// LEAK pins each tracked stage here so it can NEVER be finalized -> the Phase A
+// residual stays ~CYCLES. Read after the settle (main's GATE line) so a top-level
+// module sink is not elided as dead under V8 liveness analysis.
+const stageSink = [];
+
 // Shared no-op release. Passed as the lite-leak cleanup so the tracked record
-// closes over NOTHING (no node handle, no per-node closure): a held value that
+// closes over NOTHING (no stage handle, no per-cycle closure): a held value that
 // referenced its target would pin it forever. See lite-leak's held-value law.
 const NOOP = function () {};
+
+// Hard settle: run FinalizationRegistry callbacks to ground (>= 10 gc()+tick
+// passes) before reading tracker.size(), or the residual reads an empty window
+// and the gate falsely passes.
+async function settleHard() {
+  for (let i = 0; i < 10; i++) {
+    globalThis.gc();
+    await new Promise((r) => setTimeout(r, 15));
+  }
+}
 
 // --- helpers -----------------------------------------------------------------
 
@@ -132,40 +171,34 @@ function buildDenseStage(count) {
 
 // --- Phase A: retention ------------------------------------------------------
 
-function phaseA() {
-  const stage = createStage(makeCtx(), { maxNodes: 4096 });
-  const gid = stage.geometry(geometry.box(1, 1, 1));
-  const mid = stage.material(material({}));
-  const arena = stage.arena, nodes = stage.nodes;
+async function phaseA() {
   const tracker = createLeakTracker({ name: 'depth-retention' });
+  const live = new Int32Array(N);                   // this cycle's spawned handles
 
-  // Allocated ONCE, outside the cycle loop. leakHandles[slot] holds the lite-leak
-  // handle for the node currently in that slot; live[] the spawned handles this
-  // cycle. Both indexed by primitives -- never a closure over a node.
-  const leakHandles = new Array(4096).fill(null);
-  const live = new Int32Array(N);
-  const cap = arena.capacity;
-
-  // Leaky control (DEPTH_TORTURE_LEAK=1): a BOUNDED run of spawn-without-remove
-  // cycles kept strictly under capacity (N*LEAK_CYCLES << cap, so arena.spawn()
-  // can never throw OOM). It proves the retention property is can-fail: after
-  // leaking, BOTH oracles must read non-zero. The assertion is INVERTED and named
-  // -- a die() that reports the retention property, never an incidental arena
-  // throw. So a regression that made the oracles read zero here would be caught.
+  // Leaky control (DEPTH_TORTURE_LEAK=1): a BOUNDED run of stages that spawn
+  // WITHOUT removing AND are pinned in stageSink. After a hard settle BOTH oracles
+  // must read non-zero -- the arena law (active slots outstanding on the last
+  // stage) and the finalization residual (pinned stages never collect). The
+  // assertion is INVERTED and named, so a regression that made either oracle read
+  // clean here would be caught.
   if (LEAK) {
-    const LEAK_CYCLES = 64;                         // 64*8 = 512 spawns << 4096 cap
+    const LEAK_CYCLES = 64;
+    let lastArena = null;
     for (let cycle = 0; cycle < LEAK_CYCLES; cycle++) {
-      for (let i = 0; i < N; i++) {
-        const h = stage.addNode(gid, mid);
-        const slot = h & INDEX_MASK;
-        leakHandles[slot] = tracker.track({ slot }, NOOP, slot);
-      }
+      const stage = createStage(makeCtx(), { maxNodes: STAGE_CAP });
+      const gid = stage.geometry(geometry.box(1, 1, 1));
+      const mid = stage.material(material({}));
+      for (let i = 0; i < N; i++) stage.addNode(gid, mid);   // no remove -> slots leak
+      lastArena = stage.arena;
+      tracker.track(stage, NOOP, cycle);
+      stageSink.push(stage);                                  // pin -> never finalize
     }
-    if (arena.activeCount >= cap) die('phaseA control: hit capacity -- LEAK bound is wrong');
-    if (tracker.size() === 0 || arena.activeCount === 0) {
+    await settleHard();
+    if (lastArena.activeCount === 0 || tracker.size() === 0) {
       die('phaseA control did not leak -- retention gate is not load-bearing');
     }
-    die('retention -- activeCount=' + arena.activeCount + ' trackerSize=' + tracker.size());
+    die('retention -- lastArena.activeCount=' + lastArena.activeCount +
+      ' residual=' + tracker.size() + ' pinned=' + stageSink.length);
   }
 
   // Positive work-witness: the peak activeCount seen across cycles. If it never
@@ -173,25 +206,20 @@ function phaseA() {
   let maxActiveSeen = 0;
 
   for (let cycle = 0; cycle < CYCLES; cycle++) {
-    for (let i = 0; i < N; i++) {
-      const h = stage.addNode(gid, mid);
-      live[i] = h;
-      const slot = h & INDEX_MASK;                 // primitive tag
-      const resource = { slot };                   // models a per-node JS resource
-      leakHandles[slot] = tracker.track(resource, NOOP, slot);
-    }
+    // A FRESH stage per cycle -- the real JS object whose release we witness.
+    const stage = createStage(makeCtx(), { maxNodes: STAGE_CAP });
+    const gid = stage.geometry(geometry.box(1, 1, 1));
+    const mid = stage.material(material({}));
+    const arena = stage.arena, nodes = stage.nodes;
+    const cap = arena.capacity;
+
+    for (let i = 0; i < N; i++) live[i] = stage.addNode(gid, mid);
     // Peak of the cycle: after the N spawns, before any remove.
     if (arena.activeCount > maxActiveSeen) maxActiveSeen = arena.activeCount;
+    stage.frame(DT);                                // exercise project/cull/paint
+    for (let i = 0; i < N; i++) stage.remove(live[i]);
 
-    for (let i = 0; i < N; i++) {
-      const h = live[i];
-      const slot = h & INDEX_MASK;
-      tracker.untrack(leakHandles[slot]);
-      leakHandles[slot] = null;
-      stage.remove(h);
-    }
-
-    // Witness 1: pool conservation + drain. Witness 2: external tracker drain.
+    // Witness 1: pool conservation + drain on THIS stage.
     const free = arena.remainingCapacity();
     if (arena.activeCount + arena.retiredCount + free !== cap) {
       die('phaseA: conservation broken at cycle ' + cycle +
@@ -200,16 +228,24 @@ function phaseA() {
     }
     if (arena.activeCount !== 0) die('phaseA: activeCount ' + arena.activeCount + ' != 0 at cycle ' + cycle);
     if (nodes.count !== 0) die('phaseA: nodes.count ' + nodes.count + ' != 0 at cycle ' + cycle);
-    if (tracker.size() !== 0) die('phaseA: tracker.size ' + tracker.size() + ' != 0 at cycle ' + cycle);
+
+    // Witness 2 (AUTHORITY): track the STAGE without untracking; finalization
+    // decides its fate. Neither NOOP nor the numeric tag closes over the stage.
+    tracker.track(stage, NOOP, cycle);
   }
 
   if (maxActiveSeen <= 0) die('phaseA: activeCount never rose above 0 -- vacuous pass');
 
+  await settleHard();
+  const residual = tracker.size();
+
   return {
-    activeCount: arena.activeCount,
-    nodesCount: nodes.count,
-    trackerSize: tracker.size(),
+    activeCount: 0,          // asserted 0 every cycle above (per-stage arena)
+    nodesCount: 0,           // asserted 0 every cycle above
+    trackerSize: residual,
+    residualCeiling: RES,
     findings: tracker.audit().length,
+    pinned: stageSink.length,
   };
 }
 
@@ -375,24 +411,25 @@ function phaseD() {
 
 // --- gate --------------------------------------------------------------------
 
-function main() {
+async function main() {
   if (typeof globalThis.gc !== 'function') {
     die('run with --expose-gc:  node --expose-gc test/torture.mjs');
   }
 
-  const a = phaseA();
+  const a = await phaseA();
   const b = phaseB();
   const c = phaseC();
   const d = phaseD();
 
-  const retentionOk = a.activeCount === 0 && a.nodesCount === 0 && a.trackerSize === 0 && a.findings === 0;
+  const retentionOk = a.activeCount === 0 && a.nodesCount === 0 &&
+    a.trackerSize <= a.residualCeiling && a.findings === 0;
   const budgetOk = b.report.ok && b.bytesPerCall === 0 && d.report.ok && d.bytesPerCall === 0;
   const controlOk = c.caught;
 
   const g = b.summary.gc;
   process.stderr.write(
-    'GATE leak=size ' + a.trackerSize + '/0 findings=' + a.findings +
-    ' warnings=0' +
+    'GATE leak=size ' + a.trackerSize + '/' + a.residualCeiling + ' findings=' + a.findings +
+    ' warnings=0 pinned=' + a.pinned +
     ' | gc major=' + g.major + ' minor=' + g.minor + ' maxMs=' + g.maxMs.toFixed(2) +
     ' | alloc=' + b.bytesPerCall + ' B/op\n');
 
@@ -404,7 +441,8 @@ function main() {
   if (!retentionOk) {
     process.stderr.write(
       'torture: retention -- activeCount=' + a.activeCount + ' nodesCount=' + a.nodesCount +
-      ' trackerSize=' + a.trackerSize + ' findings=' + a.findings + ' (all must be 0)\n');
+      ' trackerSize=' + a.trackerSize + ' > ceiling ' + a.residualCeiling +
+      ' findings=' + a.findings + ' (a dropped stage outlived Phase A)\n');
   }
   if (!budgetOk) {
     process.stderr.write(
@@ -426,4 +464,7 @@ function main() {
   die('gate rejected' + (LEAK ? ' (leaky control -- expected)' : ''));
 }
 
-main();
+main().catch((e) => {
+  process.stderr.write('torture: FAIL -- ' + ((e && e.stack) || e) + '\n');
+  process.exit(1);
+});

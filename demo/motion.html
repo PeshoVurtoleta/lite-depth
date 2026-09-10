@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>lite-depth // MOTION — timeline scrubber</title>
+    <title>lite-depth // MOTION -- timeline scrubber</title>
     <style>
         :root {
             --bg: #04140b;
@@ -167,7 +167,7 @@
 <body>
 <header>
     <h1>lite-depth // <b>MOTION</b></h1>
-    <span class="sub">zero-GC keyframe mixer · clock-driven · quaternion slerp · scrub the timeline</span>
+    <span class="sub">zero-GC keyframe mixer - clock-driven - quaternion slerp - scrub the timeline</span>
 </header>
 
 <main>
@@ -175,16 +175,16 @@
     <div class="hud">
         <div><span class="k">t</span> <b id="hT">0.00</b><span class="k">s / </span><b id="hD">0.0</b><span
                 class="k">s</span></div>
-        <div><span class="k">clips</span> <b id="hC">0</b> <span class="k">· faces</span> <b id="hF">0</b> <span
-                class="k">· culled</span> <b id="hK">0</b></div>
-        <div><span class="k">draws</span> <b id="hDr">0</b> <span class="k">· sort</span> <b id="hS">0.00</b><span
+        <div><span class="k">clips</span> <b id="hC">0</b> <span class="k">- faces</span> <b id="hF">0</b> <span
+                class="k">- culled</span> <b id="hK">0</b></div>
+        <div><span class="k">draws</span> <b id="hDr">0</b> <span class="k">- sort</span> <b id="hS">0.00</b><span
                 class="k">ms</span></div>
     </div>
 </main>
 
 <footer>
     <div class="track">
-        <button id="play" class="on">⏸ pause</button>
+        <button id="play" class="on">pause</button>
         <input id="scrub" type="range" min="0" max="1000" value="0">
         <span class="clock" id="clk">0.00s</span>
     </div>
@@ -198,10 +198,21 @@
         </label>
         <label class="f">rate
             <select id="rate">
-                <option value="1">1.0×</option>
-                <option value="0.5">0.5×</option>
-                <option value="2">2.0×</option>
-                <option value="0.25">0.25×</option>
+                <option value="1">1.0x</option>
+                <option value="0.5">0.5x</option>
+                <option value="2">2.0x</option>
+                <option value="0.25">0.25x</option>
+            </select>
+        </label>
+        <label class="f">ease
+            <select id="ease">
+                <option value="easeInOutSine">easeInOutSine</option>
+                <option value="easeInOutCubic">easeInOutCubic</option>
+                <option value="easeOutCubic">easeOutCubic</option>
+                <option value="easeOutBack">easeOutBack</option>
+                <option value="easeOutBounce">easeOutBounce</option>
+                <option value="easeOutElastic">easeOutElastic</option>
+                <option value="linear">linear</option>
             </select>
         </label>
         <label class="f">props
@@ -211,7 +222,8 @@
                 <option value="64">64</option>
             </select>
         </label>
-        <button id="rebuild">↻ rebuild</button>
+        <button id="clock">time: standalone dt</button>
+        <button id="rebuild">rebuild</button>
     </div>
 </footer>
 
@@ -244,7 +256,9 @@
     const $clk = document.getElementById('clk');
     const $loop = document.getElementById('loop');
     const $rate = document.getElementById('rate');
+    const $ease = document.getElementById('ease');
     const $count = document.getElementById('count');
+    const $clock = document.getElementById('clock');
     const $rebuild = document.getElementById('rebuild');
     const $hT = document.getElementById('hT'), $hD = document.getElementById('hD');
     const $hC = document.getElementById('hC'), $hF = document.getElementById('hF');
@@ -263,6 +277,19 @@
 
     const MAX = 96;
     let stage, mixer, DUR = 4, simT = 0, playing = true;
+
+    /* control state cached in the change handlers, never read off the DOM per frame:
+       loopMode/rateVal/easeName feed the cold build(); loopOnce/loopPeriod feed the
+       hot frame(); clockMode picks the time base. demoClock is a duck-typed lite-clock
+       (only .simTime is read) so clock mode needs no extra peer. */
+    let loopMode = 'pingpong', rateVal = 1, easeName = 'easeInOutSine', clockMode = false;
+    let loopOnce = false, loopPeriod = DUR * 2;
+    const demoClock = {simTime: 0};
+
+    function recomputeLoop() {
+        loopOnce = loopMode === 'once';
+        loopPeriod = loopMode === 'pingpong' ? DUR * 2 : DUR;
+    }
 
     /* colour ramp materials (pre-baked LUTs) */
     const ramp = (h) => {
@@ -293,7 +320,9 @@
 
     function build(n) {
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const w = $c.clientWidth, h = $c.clientHeight;
+        // cached ints from the ResizeObserver (never a layout read); fit() corrects
+        // the backing size on the next frame once the observer has delivered.
+        const w = $c.__cw | 0 || 800, h = $c.__ch | 0 || 512;
         stage = createStage($ctx, {
             width: w,
             height: h,
@@ -306,9 +335,13 @@
         const gBox = stage.geometry(geometry.box(1, 1, 1));
         const gOct = stage.geometry(geometry.sphere(0.75, 6, 4));
         const mats = [stage.material(materialFromRamp(ramp(155))), stage.material(materialFromRamp(ramp(45))), stage.material(materialFromRamp(ramp(320)))];
-        mixer = createMixer(stage, {maxClips: MAX + 4});
+        // clock mode passes the duck-typed demoClock (mixer reads clock.simTime and
+        // is driven by mixer.sync()); standalone mode omits it and is driven by
+        // mixer.update(dt). Toggling rebuilds the mixer -- a cold path.
+        mixer = createMixer(stage, {maxClips: MAX + 4, clock: clockMode ? demoClock : undefined});
         DUR = 4;
-        const loop = $loop.value, rate = +$rate.value;
+        const loop = loopMode, rate = rateVal;
+        recomputeLoop();
         // Count-aware composition. The painter's per-face sort resolves SEPARATED
         // geometry exactly; its one structural blind spot is many interpenetrating
         // faces quantising to the same depth key. Two levers keep areal density --
@@ -318,7 +351,7 @@
         //   peak shrinks with n, so denser scenes use smaller props (more gaps).
         // Convergence is held at 0.72r (not the old 0.6): the mid-animation bloom
         // keeps an OPEN annulus rather than crushing every prop into one central ball
-        // -- the painter's worst case. The per-clip phase (play's rate-divided `start`)
+        // -- the painter's worst case. The per-clip phase (play's rate-divided 'start')
         // still staggers the ring into a travelling wave, not a synchronised clap.
         // Camera radius (above) pulls back with n to keep the wider ring framed.
         const R = 5 + n * 0.10;                           // 12->6.2, 32->8.2, 64->11.4
@@ -329,46 +362,73 @@
             const node = stage.addNode((i & 1) ? gBox : gOct, mats[i % 3], {});
             const x0 = Math.cos(a) * r, z0 = Math.sin(a) * r;
             const phase = i / n * DUR;
+            // pos + scale eased through the selected ease-bank name (easeName); the
+            // rotation is a dedicated quaternion slerp track: quatEuler bakes each
+            // XYZ-Euler key to a quat and quatKey slerps between them (nlerp fast path
+            // near dot 1). A four-scalar-row rotation would denormalise and never slerp.
             mixer.clip(node)
                 .posKey(0, x0, -4, z0)
-                .posKey(DUR * 0.5, x0 * CONV, 2.5, z0 * CONV, 'easeOutCubic')
+                .posKey(DUR * 0.5, x0 * CONV, 2.5, z0 * CONV, easeName)
                 .posKey(DUR, x0, -4, z0, 'easeInCubic')
                 .quatEuler(0, 0, 0, 0)
                 .quatEuler(DUR * 0.5, Math.PI, a, 0, 'easeInOutCubic')
-                .quatEuler(DUR, TAU, TAU, 0, 'easeOutCubic')
-                .scaleKey(0, 0.6).scaleKey(DUR * 0.5, peak, 'easeInOutSine').scaleKey(DUR, 0.6, 'easeInOutSine')
+                .quatKey(DUR, 0, 0, 0, 1, 'easeOutCubic')
+                .scaleKey(0, 0.6).scaleKey(DUR * 0.5, peak, easeName).scaleKey(DUR, 0.6, 'easeInOutSine')
                 .play({duration: DUR, loop, timescale: rate, start: -phase / rate});
         }
         simT = 0;
     }
 
+    /* ---- one ResizeObserver writes cached integer size per canvas (no per-frame
+       getBoundingClientRect). The rAF loop reads only these ints -- kills the
+       read-before-paint forced reflow. contentRect is supplied by the observer, so
+       reading it here is not a layout read we force. ---- */
+    const ro = new ResizeObserver((entries) => {
+        for (let i = 0; i < entries.length; i++) {
+            const e = entries[i], cr = e.contentRect, t = e.target;
+            t.__cw = Math.max(1, Math.round(cr.width));
+            t.__ch = Math.max(1, Math.round(cr.height));
+        }
+    });
+
+    /* ---- canvas sizing (reads cached ints only, never layout) ---- */
     function fit() {
+        const w = $c.__cw | 0, h = $c.__ch | 0;
+        if (w === 0 || h === 0) return;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const w = $c.clientWidth, h = $c.clientHeight;
-        if ($c.width !== (w * dpr | 0) || $c.height !== (h * dpr | 0)) {
-            $c.width = w * dpr | 0;
-            $c.height = h * dpr | 0;
+        const cw = w * dpr | 0, ch = h * dpr | 0;
+        if ($c.width !== cw || $c.height !== ch) {
+            $c.width = cw;
+            $c.height = ch;
             if (stage) stage.resize(w, h, dpr);
         }
     }
 
-    /* ── zero-alloc frame loop ── */
+    /* ---- zero-alloc frame loop ---- */
     let last = performance.now(), frameN = 0;
 
     function frame(now) {
         fit();
         const dt = Math.min((now - last) / 1000, 0.05);
         last = now;
-        const once = $loop.value === 'once', period = ($loop.value === 'pingpong') ? DUR * 2 : DUR;
         // once plays to the end and stops (the mixer re-arms on a backward scrub);
-        // loop/pingpong wrap. All modes drive the mixer to absolute simT below.
+        // loop/pingpong wrap. loopOnce/loopPeriod are cached from the loop <select>
+        // change handler, never read off the DOM here. All modes drive the mixer to
+        // absolute simT below.
         if (playing) {
             simT += dt;
-            if (once) {
+            if (loopOnce) {
                 if (simT > DUR) simT = DUR;
-            } else if (simT > period) simT -= period;
+            } else if (simT > loopPeriod) simT -= loopPeriod;
         }
-        mixer.update(simT - mixer.time);
+        // clock mode: publish simT onto the duck-typed clock and apply via sync();
+        // standalone: feed the delta to reach absolute simT. Both allocation-free.
+        if (clockMode) {
+            demoClock.simTime = simT;
+            mixer.sync();
+        } else {
+            mixer.update(simT - mixer.time);
+        }
         stage.camera.theta += dt * 0.15;
         updateCamera(stage.camera);
         const s = stage.frame(16);
@@ -383,7 +443,7 @@
             hud($hS, f2(s.tSort));
             hud($clk, f2(simT) + 's');
         }
-        if (!$scrub._drag) $scrub.value = (simT / period * 1000) | 0;
+        if (!$scrub._drag) $scrub.value = (simT / loopPeriod * 1000) | 0;
         frameN++;
         requestAnimationFrame(frame);
     }
@@ -392,28 +452,45 @@
     $play.addEventListener('click', () => {
         playing = !playing;
         $play.classList.toggle('on', playing);
-        $play.textContent = playing ? '⏸ pause' : '▶ play';
+        $play.textContent = playing ? 'pause' : 'play';
     });
     $scrub.addEventListener('pointerdown', () => {
         $scrub._drag = true;
         playing = false;
         $play.classList.remove('on');
-        $play.textContent = '▶ play';
+        $play.textContent = 'play';
     });
     $scrub.addEventListener('pointerup', () => {
         $scrub._drag = false;
     });
     $scrub.addEventListener('input', () => {
-        const period = ($loop.value === 'pingpong') ? DUR * 2 : DUR;
-        simT = (+$scrub.value / 1000) * period;
+        simT = (+$scrub.value / 1000) * loopPeriod;
     });
-    $loop.addEventListener('change', () => build(+$count.value));
-    $rate.addEventListener('change', () => build(+$count.value));
+    // cache the select values into state on change (cold), then rebuild
+    $loop.addEventListener('change', () => {
+        loopMode = $loop.value;
+        recomputeLoop();
+        build(+$count.value);
+    });
+    $rate.addEventListener('change', () => {
+        rateVal = +$rate.value;
+        build(+$count.value);
+    });
+    $ease.addEventListener('change', () => {
+        easeName = $ease.value;
+        build(+$count.value);
+    });
     $count.addEventListener('change', () => build(+$count.value));
+    $clock.addEventListener('click', () => {
+        clockMode = !clockMode;
+        $clock.classList.toggle('on', clockMode);
+        $clock.textContent = clockMode ? 'time: clock' : 'time: standalone dt';
+        build(+$count.value);
+    });
     $rebuild.addEventListener('click', () => build(+$count.value));
-    window.addEventListener('resize', fit);
 
     /* boot */
+    ro.observe($c);
     fit();
     build(+$count.value);
     requestAnimationFrame(frame);
