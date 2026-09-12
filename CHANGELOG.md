@@ -4,16 +4,61 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.6.0] - 2026-09-13
 
-Demo-only changes. The `demo/` directory ships in neither `package.json` `files[]`
-nor the npm tarball, so the published library surface is unchanged at 1.5.0. This
-brings both demos current with the v1.3.0-v1.5.0 feature surface and hardens their
-frame loops against forced synchronous reflow (the zero-byte, zero-GC failure mode
-the torture gate is structurally blind to).
+Roadmap D4 "Touch": near-plane Sutherland-Hodgman clipping and a DI-bound
+spatial-index pick surface. Also folds in the demo modernization previously staged
+under Unreleased (`demo/` ships in neither `package.json` `files[]` nor the tarball).
+
+### Added
+
+- **Near-plane Sutherland-Hodgman clip.** A face straddling the near plane (>= 1
+  vertex in front, >= 1 behind) is clipped to the plane and drawn, rather than
+  whole-face rejected. Two preallocated ping-pong polygon buffers (cap
+  `maxClipVerts`, default 16 verts/face) allocate lazily on the first straddle. A
+  fully-front face keeps a byte-identical hot body; a fully-behind face is culled
+  with no clip work and no allocation. The `clipNear` flag (default true) restores
+  the prior whole-face reject when set false.
+- **DI-bound spatial index.** `stage.useSpatialIndex(tree, { margin })` /
+  `stage.dropSpatialIndex()` bind a caller-supplied `DynamicBVH2D` (`@zakkster/lite-bvh`)
+  the same way `useSignals` binds an effect runner -- lite-bvh is a devDependency,
+  never a runtime dependency. Per frame the packed node-box lane is fattened via
+  `aabb2.fattenAll` into a disjoint buffer (margin clamped by `aabb2.marginFloor`)
+  and the tree is rebuilt with `clear()` + `insertLeaves`.
+- **Pick API.** `stage.pick(x, y, out) -> count` returns the depth-topmost hit via a
+  `queryPoint` broadphase then a back-to-front `aabb2.containsPoint` walk over the
+  sorted draw list. `stage.pickRect(x0, y0, x1, y1, out)` (marquee via `query`),
+  `stage.pickRay(p0x, p0y, p1x, p1y, out)` (via `raycast`), and
+  `stage.nearest(x, y, radius)` (via `aabb2.distanceSq`, no `sqrt`). Without a bound
+  index every pick call falls back to an O(n) back-to-front `containsPoint` scan over
+  the packed lane -- same topmost answer, zero allocation. Hit buffers are
+  caller-owned `Int32Array`s. Binding an index forces the node-box lane on so a pick
+  never broadphases a stale lane; `pick` with no index and `dirtyRect` false throws
+  (fail closed).
+- **Pointer plumbing.** `stage.attachPointer(el)` / `stage.detachPointer()` route
+  `pointerdown`/`move`/`up` to pick calls. Orbit interaction stays external.
+- **`demo/demo.html`: three new scenes** covering the v1.4.0-v1.5.0 surface --
+  Wireframe/Stroke (`fill:false + stroke` wireframe vs `fill:true + stroke`
+  fill-then-outline vs `fill:false` alone), Hierarchy Lighting (non-uniform rotated
+  parent + uniform child proving world-normal shading and `stats.nodesNonUniform`),
+  and Cull + DirtyRect (`stats.nodesCulled` vs `facesCulled` readouts, an opt-in
+  `stage.dirtyRect` toggle, and an overlay stroking `sceneBox` U `prevSceneBox`) --
+  plus a `clear()`/`reserve()` scene-reload panel reading `remainingNodes` and
+  `structureEpoch`.
+- **`#profile` dev gate.** With `location.hash === '#profile'` the demo dynamically
+  imports `@zakkster/lite-layout-profiler` for forced-reflow auditing and calls
+  `destroy()` on unload; a normal load never fetches it. Never in `files[]`.
 
 ### Changed
 
+- **Index and clip buffers allocate lazily.** `fatNodeBox`, the index-id lane, and
+  the pick scratch buffers allocate on `useSpatialIndex()`; the clip scratch allocates
+  on the first straddle. A stage that binds no index and never straddles keeps the
+  1.5.1 memory footprint.
+- **Torture gate now enforces `maxMinor: 0`.** `RULES` in `test/torture.mjs`
+  previously gated `maxMajor`, `maxPauseMs`, and `maxArrayBuffersGrowth` but not minor
+  GC; it is now at least as strict as the package's own dirtyRect zero-GC test.
+  `test/` ships in neither `files[]` nor the tarball.
 - **Demo importmap repinned** to the installed peers (`@zakkster/lite-aabb` 2.x,
   `@zakkster/lite-arena` 1.9, `@zakkster/lite-fastbit32` 1.2). `demo/demo.html` was
   still pinned to `lite-aabb@1.0.0`, whose missing `FORMAT_VERSION` tripped the
@@ -26,20 +71,6 @@ the torture gate is structurally blind to).
 - **`demo/motion.html`** caches loop/rate/ease control values on `change` instead of
   reading `.value` per frame, and adds a clock-vs-standalone-dt toggle, an ease-bank
   select, and an explicit `quatKey` slerp track.
-
-### Added
-
-- **`demo/demo.html`: three new scenes** covering the v1.4.0-v1.5.0 surface --
-  Wireframe/Stroke (`fill:false + stroke` wireframe vs `fill:true + stroke`
-  fill-then-outline vs `fill:false` alone), Hierarchy Lighting (non-uniform rotated
-  parent + uniform child proving world-normal shading and `stats.nodesNonUniform`),
-  and Cull + DirtyRect (`stats.nodesCulled` vs `facesCulled` readouts, an opt-in
-  `stage.dirtyRect` toggle, and an overlay stroking `sceneBox` U `prevSceneBox`) --
-  plus a `clear()`/`reserve()` scene-reload panel reading `remainingNodes` and
-  `structureEpoch`.
-- **`#profile` dev gate.** With `location.hash === '#profile'` the demo dynamically
-  imports `@zakkster/lite-layout-profiler` for forced-reflow auditing and calls
-  `destroy()` on unload; a normal load never fetches it. Never in `files[]`.
 
 ## [1.5.1] - 2026-08-31
 

@@ -33,6 +33,18 @@ const DEPTH_BITS = 26;               // 26-bit quantized depth key
 const DEPTH_MAX = (1 << DEPTH_BITS) - 1;
 const LAYER_SHIFT = DEPTH_BITS;      // layer occupies the high 6 bits (0..63)
 
+// drawFace lane sentinels. A real face index is tiny (F per geometry), so these
+// two top-of-range values can never collide with one. Paint discriminates with a
+// single `fi >= DRAW_CLIP` compare -- byte-identical cost to the v1.5.1 stroke
+// test -- then splits stroke vs near-clipped inside the cold branch.
+const DRAW_STROKE = 0xFFFFFFFF;      // one whole-polyline entry (v1.4.0)
+const DRAW_CLIP = 0xFFFFFFFE;        // one near-plane-clipped polygon (D4)
+// Near-clip polygon vertex cap. _clipA/_clipB hold CLIP_CAP verts of (x,y,z);
+// Sutherland-Hodgman against ONE plane yields at most inputVerts+1 output verts,
+// so a face is clip-eligible only when its vertex count is < CLIP_CAP (leaving
+// room for the +1). clipRef packs the vertex count in its low 5 bits (0..31).
+const CLIP_CAP = 16;
+
 // Flag namespace via lite-fastbit32 BitMapper (cold). Per-node bits live in a
 // Uint32Array lane and are tested inline on the hot path.
 export const FLAGS = new BitMapper([
@@ -313,6 +325,11 @@ export function createStage(ctx, opts) {
   let maxNodes = o.maxNodes || 4096;
   const maxVerts = o.maxVerts || 262144;      // total projected verts per frame
   const maxDrawFaces = o.maxDrawFaces || 131072;
+  // Near-clip scratch budget: total screen verts produced by near-plane clipping
+  // across ALL straddling faces this frame. A straddling face emits ONE draw entry
+  // and up to CLIP_CAP screen verts; the clip overflow door rejects a face whole
+  // (fail closed) once this fills. Modest by default -- straddling faces are rare.
+  const maxClipVerts = o.maxClipVerts || 4096;
 
   const arena = new Arena(maxNodes);
   // One SoA component holding every per-node lane. Swap-and-pop on despawn
@@ -344,6 +361,19 @@ export function createStage(ctx, opts) {
   const drawNode = new Uint32Array(maxDrawFaces); // dense node index
   const drawFace = new Uint32Array(maxDrawFaces);
   const shadeL = new Uint8Array(maxDrawFaces);    // per-draw-entry baked LUT index (shade computed in collect)
+  // Near-clip lanes. clipXY holds the projected (x,y) of every clipped polygon
+  // vertex this frame; clipRef, indexed by draw entry, packs (startVert << 5) |
+  // vertCount for a DRAW_CLIP entry so paint reads the polygon without touching
+  // geometry. Both are frame scratch, written only when a face straddles near.
+  // All clip scratch is LAZY: allocated by ensureClip() on the FIRST near-plane
+  // straddle, never at ctor. A stage that never straddles (the common case) keeps
+  // the v1.5.1 memory footprint, so bulk stage churn does not perturb GC. The SH
+  // ping-pong buffers are VIEW-space (x,y,z) interleaved, cap CLIP_CAP verts; the
+  // clip runs on the cold straddle path only, never reentrant within one frame.
+  let clipXY = null;                               // 2*maxClipVerts screen (x,y) of clipped polys
+  let clipRef = null;                              // maxDrawFaces: (startVert << 5) | vertCount
+  let _clipA = null, _clipB = null;                // CLIP_CAP*3 each
+  let _clipWrite = 0;                              // running clipXY vertex offset this frame
 
   // radix scratch (LSD, 4x8-bit)
   const orderA = new Uint32Array(maxDrawFaces);
@@ -383,10 +413,34 @@ export function createStage(ctx, opts) {
   let nodeBox = new Float32Array(4 * maxNodes);
   const _sceneBox = aabb2.setEmpty(aabb2.create());
   const _prevBox = aabb2.setEmpty(aabb2.create());
+  // Optional spatial-index DI (cold binding via useSpatialIndex). lite-bvh's
+  // DynamicBVH2D is DI-bound here, never a runtime dep. Per frame the fat node
+  // boxes (fatNodeBox, DISJOINT from nodeBox -- the tree's SAH descent reads it
+  // while lite-bvh refits, and fattenAll's aliasing law wants a separate buffer)
+  // and their dense-index data (idxData) are rebuilt then clear()+insertLeaves'd.
+  let _index = null;                 // bound tree, or null (fail closed: null != index)
+  let _indexMargin = 0;              // user fatten margin, clamped up by marginFloor per box
+  // Index + pick scratch is LAZY too: allocated by useSpatialIndex(), never at ctor.
+  // A stage that never binds an index keeps the v1.5.1 footprint. fatNodeBox is
+  // 4*maxNodes; idxData/pickCand/pickMark are maxNodes; all grown by reserve() only
+  // once allocated. pickCand+pickMark let the sorted back-to-front pick walk test
+  // only broadphase candidates without re-scanning; zero-alloc on every pick.
+  let fatNodeBox = null;
+  let idxData = null;
+  let pickCand = null;
+  let pickMark = null;
+  let pickStamp = 0;
+  const _qbox = aabb2.create();                  // query / point box scratch (cold pick path)
   // Cached viewport cull scalars (was the _viewport box; the per-face intersects is
   // now four inline compares). Viewport is (0,0,width,height) -- the screen space
   // screenXY is computed in. Refreshed at create + resize (cold).
   let _vx0 = 0, _vy0 = 0, _vx1 = 0, _vy1 = 0;
+  // NOTE: the per-frame projection scalars (halfW/halfH/focal/ortho/orthoK) are
+  // DELIBERATELY NOT captured in closure vars for clipFace -- they are passed as
+  // arguments on the cold straddle path. A captured non-Smi double (focal, halfW/H)
+  // written every frame would box a HeapNumber into the shared frame()/clipFace
+  // context and leak minor GC on the always-on frame path. clipFace's only closure
+  // state is _clipWrite (a Smi cursor), which never boxes.
 
   const stage = {
     ctx, arena, nodes, camera: createCamera(o.camera),
@@ -398,6 +452,11 @@ export function createStage(ctx, opts) {
     // maintain sceneBox/prevBox for incremental canvas redraw. The per-node screen
     // AABB *cull* is always on and independent of this flag.
     dirtyRect: false,
+    // Near-plane clip toggle (D4). ON by default: a face straddling the near plane
+    // is clipped and drawn. Set false to restore the v1.5.1 behaviour (a straddling
+    // face is near-culled whole) -- purely a visibility choice on the cold straddle
+    // path, no cost to the fully-front fast path either way.
+    clipNear: true,
     _signals: null,
     stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0 },
     _topoDirty: true,
@@ -419,7 +478,9 @@ export function createStage(ctx, opts) {
     get sceneBox() { return _sceneBox; },
     get prevSceneBox() { return _prevBox; },
   };
-  stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY };
+  stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY, box: nodeBox, clipXY: null, clipRef: null };
+  stage.picked = -1;                             // last picked dense node index (pointer plumbing), -1 = none
+  stage.onPick = null;                           // optional (id, ev) => void callback
   stage._geometries = geometries;
   { const l = stage.light, inv = 1 / (Math.hypot(l[0], l[1], l[2]) || 1); l[0] *= inv; l[1] *= inv; l[2] *= inv; }
   _vx0 = 0; _vy0 = 0; _vx1 = stage.width; _vy1 = stage.height;
@@ -505,6 +566,15 @@ export function createStage(ctx, opts) {
     // [0, count) is preserved; the tail is fresh zero. Cold allocation is legal.
     const nv = new Int32Array(n); nv.set(vertBase); vertBase = nv; stage._draw.vertBase = nv;
     const nnb = new Float32Array(4 * n); nnb.set(nodeBox); nodeBox = nnb;  // node-box lane: 4 floats/node
+    stage._draw.box = nnb;
+    // spatial-index lanes grow in lockstep with the node-box lane they mirror --
+    // but only once allocated (lazy: a stage with no bound index has them null).
+    if (fatNodeBox !== null) {
+      const nfb = new Float32Array(4 * n); nfb.set(fatNodeBox); fatNodeBox = nfb;
+      const nid = new Int32Array(n); nid.set(idxData); idxData = nid;
+      const npc = new Int32Array(n); npc.set(pickCand); pickCand = npc;
+      const npm = new Uint32Array(n); npm.set(pickMark); pickMark = npm;
+    }
     const nt = new Uint32Array(n); nt.set(topo); topo = nt;
     const npd = new Int32Array(n); npd.set(parentDense); parentDense = npd;
     const nr = new Uint8Array(n); nr.set(recomputed); recomputed = nr;
@@ -528,6 +598,192 @@ export function createStage(ctx, opts) {
           : null;
     if (!setter) throw new Error('lite-depth: unknown bind channel ' + channel);
     stage._signals.effect(() => setter(get()));   // cold effect; writes lanes + marks dirty
+  };
+
+  /* -- cold: spatial-index DI (lite-bvh, DI-bound never a runtime dep) -- */
+  // Bind a DynamicBVH2D-shaped tree. Mirrors useSignals: cold, returns stage.
+  // Binding an index FORCES the per-node screen-box lane on (see frame(): wantBox
+  // is `dirtyRect || _index !== null`) -- nodeBox is written only under that lane,
+  // so an index that did not force it would read a stale/empty box every pick.
+  // Per frame the fat boxes are rebuilt and the tree is clear()'d + re-inserted
+  // (simple, correct; updateLeaf/dense-remap deferred -- measure first).
+  stage.useSpatialIndex = (tree, opts) => {
+    if (!tree || typeof tree.insertLeaves !== 'function' || typeof tree.queryPoint !== 'function' ||
+        typeof tree.query !== 'function' || typeof tree.raycast !== 'function' || typeof tree.clear !== 'function') {
+      throw new Error('lite-depth: useSpatialIndex(tree) needs a DynamicBVH2D-shaped tree with ' +
+        'insertLeaves/queryPoint/query/raycast/clear -- got ' + (tree ? typeof tree : String(tree)));
+    }
+    const oo = opts || {};
+    for (const k in oo) {
+      if (k !== 'margin') throw new Error('lite-depth: useSpatialIndex unknown option "' + k + '" -- did you mean "margin"?');
+    }
+    const mg = oo.margin;
+    if (mg !== undefined && !(Number.isFinite(mg) && mg >= 0)) {
+      throw new Error('lite-depth: useSpatialIndex margin must be a non-negative finite number, got ' + mg);
+    }
+    // Lazy first-bind allocation of the index + pick scratch (see their decls).
+    if (fatNodeBox === null) {
+      fatNodeBox = new Float32Array(4 * maxNodes);
+      idxData = new Int32Array(maxNodes);
+      pickCand = new Int32Array(maxNodes);
+      pickMark = new Uint32Array(maxNodes);
+    }
+    _index = tree;
+    _indexMargin = mg === undefined ? 0 : mg;
+    return stage;
+  };
+  // Unbind the index (fail closed: pick reverts to the dirtyRect-gated fallback).
+  stage.dropSpatialIndex = () => { _index = null; return stage; };
+
+  // Rebuild the bound tree from this frame's node boxes. Compacts the VALID
+  // (finite, non-empty) boxes only -- culled/skipped nodes carry the empty merge
+  // identity and would make insertLeaves throw (batch-atomic) -- fattening each by
+  // max(userMargin, marginFloor(box)) so the fat box is STRICTLY larger than the
+  // tight box even at 1e7 screen coords (a fixed sub-ulp margin would round away).
+  // Zero allocation: scratch is preallocated; clear()+insertLeaves reuse the tree's
+  // own scratch. userData is the dense node index, valid THIS frame only (rebuilt
+  // every frame, so swap-and-pop reindexing never strands a stale leaf).
+  function rebuildIndex(count) {
+    const tree = _index, userMargin = _indexMargin;
+    let m = 0;
+    for (let d = 0; d < count; d++) {
+      const j = d << 2;
+      const x0 = nodeBox[j], y0 = nodeBox[j + 1], x1 = nodeBox[j + 2], y1 = nodeBox[j + 3];
+      if (x0 <= x1 && y0 <= y1) {                  // valid + non-empty (NaN/empty fall through)
+        _qbox[0] = x0; _qbox[1] = y0; _qbox[2] = x1; _qbox[3] = y1;
+        const fl = aabb2.marginFloor(_qbox);
+        const mg = userMargin > fl ? userMargin : fl;
+        const k = m << 2;
+        fatNodeBox[k] = x0 - mg; fatNodeBox[k + 1] = y0 - mg; fatNodeBox[k + 2] = x1 + mg; fatNodeBox[k + 3] = y1 + mg;
+        idxData[m] = d; m++;
+      }
+    }
+    tree.clear();
+    if (m > 0) tree.insertLeaves(fatNodeBox, idxData, m);
+  }
+
+  /* -- cold: screen-space picking (post-projection; NOT 3D geometry raycast) -- */
+  // Every pick needs the per-node screen-box lane populated: a bound index forces
+  // it (wantBox), else dirtyRect must be on. Fail closed rather than read a stale
+  // lane and return a phantom hit.
+  function needBoxes() {
+    if (_index === null && stage.dirtyRect !== true) {
+      throw new Error('lite-depth: pick*/nearest need a bound spatial index (useSpatialIndex) ' +
+        'or dirtyRect=true -- both populate the per-node screen-box lane pick reads.');
+    }
+  }
+
+  // Topmost node under a screen point, or -1. Walks the SORTED draw list back-to-
+  // front (last-painted = nearest) and returns the first node whose TIGHT screen
+  // box contains the point -- identical with or without a bound index. With an
+  // index, queryPoint prunes to broadphase candidates (fat box >= tight box, so a
+  // tight hit is always a candidate); the stamp map avoids a re-scan. Without one,
+  // the fallback is the same back-to-front containsPoint walk over the sorted list
+  // -- O(draw), zero-alloc, and depth-correct (aabb2.intersectsAny returns the
+  // first box in DENSE order, not the topmost, so it cannot answer this query).
+  stage.pick = (x, y, out) => {
+    needBoxes();
+    const order = _pubOrder, dc = _pubDrawCount;
+    if (_index !== null) {
+      const nc = _index.queryPoint(x, y, pickCand);
+      if (nc === 0) return 0;
+      let s = (pickStamp + 1) >>> 0; if (s === 0) { pickMark.fill(0); s = 1; } pickStamp = s;
+      for (let k = 0; k < nc; k++) pickMark[pickCand[k]] = s;
+      for (let i = dc - 1; i >= 0; i--) {
+        const d = drawNode[order[i]];
+        if (pickMark[d] === s) {
+          const j = d << 2;
+          if (x >= nodeBox[j] && x <= nodeBox[j + 2] && y >= nodeBox[j + 1] && y <= nodeBox[j + 3]) { out[0] = d; return 1; }
+        }
+      }
+      return 0;
+    }
+    for (let i = dc - 1; i >= 0; i--) {
+      const d = drawNode[order[i]];
+      const j = d << 2;
+      if (x >= nodeBox[j] && x <= nodeBox[j + 2] && y >= nodeBox[j + 1] && y <= nodeBox[j + 3]) { out[0] = d; return 1; }
+    }
+    return 0;
+  };
+
+  // Marquee: dense node indices whose screen box overlaps the rect, into the
+  // caller-owned out. With an index, one tree.query; else an O(n) intersects scan.
+  stage.pickRect = (x0, y0, x1, y1, out) => {
+    needBoxes();
+    const minx = x0 < x1 ? x0 : x1, maxx = x0 < x1 ? x1 : x0;
+    const miny = y0 < y1 ? y0 : y1, maxy = y0 < y1 ? y1 : y0;
+    _qbox[0] = minx; _qbox[1] = miny; _qbox[2] = maxx; _qbox[3] = maxy;
+    if (_index !== null) return _index.query(_qbox, out);
+    const count = nodes.count, cap = out.length; let c = 0;
+    for (let d = 0; d < count; d++) {
+      const j = d << 2;
+      if (nodeBox[j] <= maxx && nodeBox[j + 2] >= minx && nodeBox[j + 1] <= maxy && nodeBox[j + 3] >= miny) {
+        if (c >= cap) break; out[c++] = d;
+      }
+    }
+    return c;
+  };
+
+  // Segment pick: dense node indices whose screen box the segment p0->p1 crosses,
+  // into out. With an index, tree.raycast; else an O(n) slab test. Non-finite
+  // endpoints return 0 (fail closed), matching lite-bvh's raycast door.
+  stage.pickRay = (p0x, p0y, p1x, p1y, out) => {
+    needBoxes();
+    if (_index !== null) return _index.raycast(p0x, p0y, p1x, p1y, out);
+    if (!(Number.isFinite(p0x) && Number.isFinite(p0y) && Number.isFinite(p1x) && Number.isFinite(p1y))) return 0;
+    const count = nodes.count, cap = out.length, dx = p1x - p0x, dy = p1y - p0y; let c = 0;
+    for (let d = 0; d < count; d++) {
+      const j = d << 2, bx0 = nodeBox[j], by0 = nodeBox[j + 1], bx1 = nodeBox[j + 2], by1 = nodeBox[j + 3];
+      if (!(bx0 <= bx1 && by0 <= by1)) continue;   // empty / NaN box
+      let tmin = 0, tmax = 1;
+      if (dx !== 0) { let t1 = (bx0 - p0x) / dx, t2 = (bx1 - p0x) / dx; if (t1 > t2) { const tt = t1; t1 = t2; t2 = tt; } if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2; }
+      else if (p0x < bx0 || p0x > bx1) continue;
+      if (dy !== 0) { let t1 = (by0 - p0y) / dy, t2 = (by1 - p0y) / dy; if (t1 > t2) { const tt = t1; t1 = t2; t2 = tt; } if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2; }
+      else if (p0y < by0 || p0y > by1) continue;
+      if (tmin <= tmax) { if (c >= cap) break; out[c++] = d; }
+    }
+    return c;
+  };
+
+  // Nearest node whose screen box is within `radius` px of the point, or -1.
+  // Squared distance only (aabb2.distanceSq inlined), radius test d2 < r*r -- NO
+  // Math.sqrt on either side. O(n) over the box lane; zero-alloc.
+  stage.nearest = (x, y, radius) => {
+    needBoxes();
+    const count = nodes.count, r2 = radius * radius;
+    let best = -1, bestD = r2;
+    for (let d = 0; d < count; d++) {
+      const j = d << 2, bx0 = nodeBox[j], by0 = nodeBox[j + 1], bx1 = nodeBox[j + 2], by1 = nodeBox[j + 3];
+      if (!(bx0 <= bx1 && by0 <= by1)) continue;   // empty / NaN box
+      const ddx = Math.max(0, bx0 - x, x - bx1), ddy = Math.max(0, by0 - y, y - by1);
+      const d2 = ddx * ddx + ddy * ddy;
+      if (d2 < bestD) { bestD = d2; best = d; }
+    }
+    return best;
+  };
+
+  /* -- cold: pointer plumbing -> pick only -- */
+  // pointerdown/move/up route to pick(); orbit/camera interaction is DELIBERATELY
+  // not here -- it ships as a separate companion package (roadmap #1), so this
+  // stays a thin, zero-alloc pick dispatcher. offsetX/offsetY avoid the DOMRect
+  // allocation getBoundingClientRect would incur in a pointer handler.
+  const _pickOut = new Int32Array(1);
+  stage._onPointer = (ev) => {
+    const n = stage.pick(ev.offsetX, ev.offsetY, _pickOut);
+    stage.picked = n > 0 ? _pickOut[0] : -1;
+    const cb = stage.onPick; if (cb) cb(stage.picked, ev);
+  };
+  stage.attachPointer = (el) => {
+    el.addEventListener('pointerdown', stage._onPointer);
+    el.addEventListener('pointermove', stage._onPointer);
+    el.addEventListener('pointerup', stage._onPointer);
+    return stage;
+  };
+  stage.detachPointer = (el) => {
+    el.removeEventListener('pointerdown', stage._onPointer);
+    el.removeEventListener('pointermove', stage._onPointer);
+    el.removeEventListener('pointerup', stage._onPointer);
+    return stage;
   };
 
   /* ── topo rebuild (cold, on structural change) ── */
@@ -652,6 +908,10 @@ export function createStage(ctx, opts) {
     const focal = ortho ? 0 : (0.5 * Math.min(stage.width, stage.height)) / Math.tan(cam.fov * 0.5);
     const orthoK = (Math.min(stage.width, stage.height) * 0.5) / cam.orthoScale;
     const zSpan = (far - near) || 1;         // positive span; maps viewZ [-far,-near] -> [0, DEPTH_MAX]
+    // Reset the per-frame clipXY write cursor (a Smi; safe to write to the shared
+    // clipFace context). Projection scalars are passed to clipFace as arguments,
+    // not captured -- see the note by _clipWrite's declaration.
+    _clipWrite = 0;
     // directional light, hoisted once above the node loop. Shade is now baked into
     // the shadeL lane in this pass (per node: back-rotate the light through the
     // WORLD upper-3x3; per face: one dot). paint() no longer touches the light.
@@ -663,7 +923,13 @@ export function createStage(ctx, opts) {
     // node). When on, seed every LIVE node's box empty so any node the loop skips
     // (invisible / invalid / overflowed / node-culled / fail-open) contributes the
     // merge identity to the scene bbox; drawn nodes overwrite their slot below.
-    const wantBox = stage.dirtyRect === true;
+    // A bound spatial index FORCES the box lane on: nodeBox is written only under
+    // wantBox, and pick reads it -- an index that did not force it would broadphase
+    // over stale/empty boxes. So wantBox = dirtyRect OR an index is bound.
+    const wantBox = stage.dirtyRect === true || _index !== null;
+    // Near-clip toggle, hoisted once (a per-face read would cost bytes). Only ever
+    // consulted on the cold straddle branch below.
+    const doClip = stage.clipNear !== false;
     if (wantBox) {
       for (let d = 0; d < count; d++) { const j = d << 2; nodeBox[j] = Infinity; nodeBox[j + 1] = Infinity; nodeBox[j + 2] = -Infinity; nodeBox[j + 3] = -Infinity; }
     }
@@ -816,7 +1082,24 @@ export function createStage(ctx, opts) {
           const X = screenXY[vi * 2], Y = screenXY[vi * 2 + 1];
           if (X < minx) minx = X; if (X > maxx) maxx = X; if (Y < miny) miny = Y; if (Y > maxy) maxy = Y;
         }
-        if (nearBad) { st.facesCulled++; continue; }
+        // A vertex touched/crossed the near plane. The fully-front fast path (no
+        // break above) is byte-identical to v1.5.1; the near-touching face drops to
+        // the COLD clip helper, which decides straddle-vs-fully-behind by a full
+        // re-scan (order-independent) and either emits a near-clipped polygon
+        // (dc + 1) or rejects the whole face (facesCulled + 1). All clip bytes live
+        // in clipFace, not this loop -- a scene with no straddling face never calls it.
+        if (nearBad) {
+          // A vertex is behind the near plane. Only a face that ALSO has a front
+          // vertex STRADDLES and needs clipping; a fully-behind face is culled
+          // exactly as v1.5.1 -- no clip work and no clip-scratch allocation, so a
+          // scene of behind-near faces keeps the baseline footprint. The straddle
+          // probe (breaks on the first front vert) is on this cold branch only.
+          let straddles = false;
+          if (doClip) { for (let j = o0; j < o1; j++) { if (viewZ[base + fv[j]] <= -near) { straddles = true; break; } } }
+          if (straddles) dc = clipFace(dc, d, fi, near, far, zSpan, tainted, Lbx, Lby, Lbz, matK1, bias, layerL[d], halfW, halfH, focal, ortho, orthoK);
+          else st.facesCulled++;
+          continue;
+        }
         // viewport cull, inline (was aabb2.set + aabb2.intersects). Byte-identical
         // to the intersects predicate against the cached viewport scalars. A NaN
         // face bound makes a compare false => the face is culled = FAIL CLOSED
@@ -864,6 +1147,10 @@ export function createStage(ctx, opts) {
     // fully-empty frame yields the canonical empty box). Off => zero added cost.
     if (wantBox) { aabb2.copy(_prevBox, _sceneBox); aabb2.mergeAll(_sceneBox, nodeBox, count); }
 
+    // Rebuild the bound spatial index from this frame's completed node boxes (all
+    // written above under the forced box lane). clear()+insertLeaves; zero-alloc.
+    if (_index !== null) rebuildIndex(count);
+
     /* radix sort permutation of [0,dc) by drawKey (LSD, 4x8-bit) */
     t = clock.now();
     let src = orderA, dst = orderB;
@@ -905,6 +1192,107 @@ export function createStage(ctx, opts) {
     return DEPTH_MAX;
   }
 
+  // Cold near-plane clip of a face that touched/crossed z = -near. Sutherland-
+  // Hodgman in VIEW space against that one plane, ping-ponging over _clipA/_clipB.
+  // View coords are rebuilt from geometry (a behind-near vert's screenXY is garbage
+  // -- it was divided by ~0 -- so it cannot be recovered from the projected lane).
+  // Emits ONE draw entry (DRAW_CLIP sentinel + clipRef {start,count}) and returns
+  // dc+1 on success, else bumps facesCulled and returns dc unchanged. Zero alloc.
+  // Lazy one-time allocation of the near-clip scratch, on the first straddle only.
+  function ensureClip() {
+    if (clipXY !== null) return;
+    clipXY = new Float64Array(2 * maxClipVerts);
+    clipRef = new Uint32Array(maxDrawFaces);
+    _clipA = new Float64Array(CLIP_CAP * 3);
+    _clipB = new Float64Array(CLIP_CAP * 3);
+    stage._draw.clipXY = clipXY;
+    stage._draw.clipRef = clipRef;
+  }
+
+  function clipFace(dc, d, fi, near, far, zSpan, tainted, Lbx, Lby, Lbz, matK1, bias, layer, halfW, halfH, focal, ortho, orthoK) {
+    const D = nodes.data, st = stage.stats;
+    if (clipXY === null) ensureClip();
+    const g = geometries[D.geom[d]];
+    const off = g.faceVertOffset, fv = g.faceVerts, gv = g.verts;
+    const o0 = off[fi], o1 = off[fi + 1], n = o1 - o0;
+    // SH against one plane yields <= n+1 verts; the buffers hold CLIP_CAP. A face
+    // with too many verts is rejected whole (fail closed) rather than overrun.
+    if (n < 3 || n >= CLIP_CAP) { st.facesCulled++; return dc; }
+    const M0 = D.m0[d], M1 = D.m1[d], M2 = D.m2[d], M3 = D.m3[d], M4 = D.m4[d], M5 = D.m5[d];
+    const M6 = D.m6[d], M7 = D.m7[d], M8 = D.m8[d], M9 = D.m9[d], M10 = D.m10[d], M11 = D.m11[d];
+    const V = stage.camera.view;
+    // input polygon -> _clipA as (vx,vy,vz)
+    for (let j = o0, k = 0; j < o1; j++, k++) {
+      const vidx = fv[j] * 3, lx = gv[vidx], ly = gv[vidx + 1], lz = gv[vidx + 2];
+      const wx = M0 * lx + M1 * ly + M2 * lz + M3, wy = M4 * lx + M5 * ly + M6 * lz + M7, wz = M8 * lx + M9 * ly + M10 * lz + M11;
+      _clipA[k * 3] = V[0] * wx + V[1] * wy + V[2] * wz + V[3];
+      _clipA[k * 3 + 1] = V[4] * wx + V[5] * wy + V[6] * wz + V[7];
+      _clipA[k * 3 + 2] = V[8] * wx + V[9] * wy + V[10] * wz + V[11];
+    }
+    // clip to the half-space vz <= -near (in front of the near plane). Point on the
+    // plane has vz === -near; the intersection param is exact on that boundary.
+    const plane = -near;
+    let outN = 0;
+    for (let i = 0; i < n; i++) {
+      const a3 = i * 3, b3 = ((i + 1) % n) * 3;
+      const az = _clipA[a3 + 2], bz = _clipA[b3 + 2];
+      const aIn = az <= plane, bIn = bz <= plane;
+      if (aIn) { _clipB[outN * 3] = _clipA[a3]; _clipB[outN * 3 + 1] = _clipA[a3 + 1]; _clipB[outN * 3 + 2] = az; outN++; }
+      if (aIn !== bIn) {
+        const tt = (plane - az) / (bz - az);
+        _clipB[outN * 3] = _clipA[a3] + tt * (_clipA[b3] - _clipA[a3]);
+        _clipB[outN * 3 + 1] = _clipA[a3 + 1] + tt * (_clipA[b3 + 1] - _clipA[a3 + 1]);
+        _clipB[outN * 3 + 2] = plane;
+        outN++;
+      }
+    }
+    if (outN < 3) { st.facesCulled++; return dc; }              // fully behind / degenerate
+    if (_clipWrite + outN > (clipXY.length >> 1)) { st.facesCulled++; return dc; }  // clip lane overflow (fail closed)
+    // project clipped view verts to screen -> clipXY, accumulate centroid z + bbox
+    const w0 = _clipWrite;
+    let czSum = 0, minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (let i = 0; i < outN; i++) {
+      const vx = _clipB[i * 3], vy = _clipB[i * 3 + 1], vz = _clipB[i * 3 + 2];
+      czSum += vz;
+      let sX, sY;
+      if (ortho) { sX = halfW + vx * orthoK; sY = halfH - vy * orthoK; }
+      else { const inv = focal / (-vz); sX = halfW + vx * inv; sY = halfH - vy * inv; }
+      clipXY[(w0 + i) * 2] = sX; clipXY[(w0 + i) * 2 + 1] = sY;
+      if (sX < minx) minx = sX; if (sX > maxx) maxx = sX; if (sY < miny) miny = sY; if (sY > maxy) maxy = sY;
+    }
+    // viewport cull (fail closed on a NaN bound) + backface cull, mirroring the hot
+    // face path exactly so a clipped face obeys the same visibility rules.
+    if (!(minx <= _vx1 && maxx >= _vx0 && miny <= _vy1 && maxy >= _vy0)) { st.facesCulled++; return dc; }
+    const ax = clipXY[w0 * 2], ay = clipXY[w0 * 2 + 1];
+    const bx = clipXY[(w0 + 1) * 2], by = clipXY[(w0 + 1) * 2 + 1];
+    const cx2 = clipXY[(w0 + 2) * 2], cy2 = clipXY[(w0 + 2) * 2 + 1];
+    const area = (bx - ax) * (cy2 - ay) - (cx2 - ax) * (by - ay);
+    if (area >= 0 && (D.flags[d] & F_DOUBLE) === 0) { st.facesCulled++; return dc; }
+    // shade -- identical kernel to the hot face loop (uniform: one dot with the
+    // back-rotated light; tainted: the per-node normal matrix _NM still holds this
+    // node's inverse-transpose from the collect pass).
+    const fn = g.faceNormal, nx = fn[fi * 3], ny = fn[fi * 3 + 1], nz = fn[fi * 3 + 2];
+    let ndl;
+    if (tainted !== 0) {
+      const wnx = _NM[0] * nx + _NM[1] * ny + _NM[2] * nz;
+      const wny = _NM[3] * nx + _NM[4] * ny + _NM[5] * nz;
+      const wnz = _NM[6] * nx + _NM[7] * ny + _NM[8] * nz;
+      const ln2 = wnx * wnx + wny * wny + wnz * wnz;
+      if (ln2 > 0) { const invL = 1 / Math.sqrt(ln2); ndl = (wnx * stage.light[0] + wny * stage.light[1] + wnz * stage.light[2]) * invL; }
+      else ndl = 0;
+    } else {
+      ndl = nx * Lbx + ny * Lby + nz * Lbz;
+    }
+    if (ndl < 0) ndl = 0; else if (ndl > 1) ndl = 1;
+    // emit one draw entry; clipRef packs (startVert << 5) | vertCount (outN <= 16).
+    drawKey[dc] = packKey(layer, quantize(czSum / outN + bias, near, far, zSpan));
+    drawNode[dc] = d; drawFace[dc] = DRAW_CLIP;
+    clipRef[dc] = (w0 << 5) | outN;
+    shadeL[dc] = (ndl * matK1) | 0;
+    _clipWrite = w0 + outN;
+    return dc + 1;
+  }
+
   function paint(order, dc) {
     const c = ctx, D = nodes.data;
     const geomL = D.geom, matL = D.mat;
@@ -928,13 +1316,29 @@ export function createStage(ctx, opts) {
       const g = geometries[geomL[d]], mat = materials[matL[d]];
       const base = vertBase[d];
 
-      if (fi === 0xFFFFFFFF) {  // stroke polyline
-        if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } open = false; curStyle = null; }
-        c.strokeStyle = mat.stroke || mat.lut[mat.K - 1];
-        c.lineWidth = mat.lineWidth;
-        c.beginPath();
-        for (let v = 0; v < g.V; v++) { const X = screenXY[(base + v) * 2], Y = screenXY[(base + v) * 2 + 1]; if (v === 0) c.moveTo(X, Y); else c.lineTo(X, Y); }
-        c.stroke(); st.drawCalls++; st.facesDrawn++;
+      // Sentinel split: one `fi >= DRAW_CLIP` compare (same cost as the v1.5.1
+      // `=== 0xFFFFFFFF`) routes both cold entry kinds out of the fill path.
+      if (fi >= DRAW_CLIP) {
+        if (fi === DRAW_STROKE) {  // stroke polyline
+          if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } open = false; curStyle = null; }
+          c.strokeStyle = mat.stroke || mat.lut[mat.K - 1];
+          c.lineWidth = mat.lineWidth;
+          c.beginPath();
+          for (let v = 0; v < g.V; v++) { const X = screenXY[(base + v) * 2], Y = screenXY[(base + v) * 2 + 1]; if (v === 0) c.moveTo(X, Y); else c.lineTo(X, Y); }
+          c.stroke(); st.drawCalls++; st.facesDrawn++;
+          continue;
+        }
+        // DRAW_CLIP: a near-plane-clipped polygon. clipRef packs the clipXY start
+        // vertex (>> 5) and vertex count (& 31). Style-run-batched like a fill.
+        const ref = clipRef[e], cvN = ref & 31, cw0 = ref >>> 5;
+        const cstyle = mat.lut[shadeL[e]], cfill = mat.fill, cstroke = mat.stroke;
+        if (cstyle !== curStyle || cfill !== curFill || cstroke !== curStroke) {
+          if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } }
+          c.fillStyle = cstyle; curStyle = cstyle; curFill = cfill; curStroke = cstroke; curLineWidth = mat.lineWidth; c.beginPath(); open = true;
+        }
+        for (let k = 0; k < cvN; k++) { const X = clipXY[(cw0 + k) * 2], Y = clipXY[(cw0 + k) * 2 + 1]; if (k === 0) c.moveTo(X, Y); else c.lineTo(X, Y); }
+        c.closePath();
+        st.facesDrawn++;
         continue;
       }
 
@@ -959,4 +1363,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.5.1';
+export const version = '1.6.0';

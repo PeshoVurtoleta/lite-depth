@@ -91,6 +91,9 @@
 import { createStage, geometry, material } from '../Depth.js';
 import { checkNoGc, measureOps, measureAllocs } from '@zakkster/lite-gc-profiler';
 import { createLeakTracker } from '@zakkster/lite-leak';
+// lite-bvh is DI-bound (devDependency, never a runtime dep of Depth.js). Phase E
+// drives the real pick index through the stage's useSpatialIndex() binding.
+import { DynamicBVH2D } from '@zakkster/lite-bvh';
 
 // --- config -----------------------------------------------------------------
 
@@ -107,7 +110,10 @@ const DT = 1 / 60;
 // real leak leaves ~CYCLES.
 const RES = Math.max(16, (CYCLES / 1000) | 0); // 16
 
-const RULES = { maxMajor: 0, maxPauseMs: 4, maxArrayBuffersGrowth: 0 };
+// maxMinor:0 is enforced so the official gate is at least as strict as the
+// package's own zero-GC node:test (test/14 gates minor=0). A minor-GC regression
+// on the always-on frame path must never slip through green again.
+const RULES = { maxMajor: 0, maxMinor: 0, maxPauseMs: 4, maxArrayBuffersGrowth: 0 };
 
 // Skip every remove() AND pin every stage -- the deliberately-leaky Phase A
 // control. See header.
@@ -409,6 +415,123 @@ function phaseD() {
   };
 }
 
+// --- Phase E: pick index -- differential correctness + zero-alloc pick path ---
+//
+// D4 "Touch". A down-z stage with a DI-bound DynamicBVH2D. It gates:
+//   - the nodeBox->bvh ROUND TRIP (phaseD extension): binding an index forces the
+//     box lane on, the per-frame clear()+insertLeaves rebuilds the tree, and the
+//     tree stays VALID with maxNodes + every backing byteLength IDENTICAL across
+//     HOT_FRAMES (no realloc -- the clear()+insertLeaves path, not updateLeaf).
+//   - the pick DIFFERENTIAL: pick(x,y) == the brute-force back-to-front
+//     containsPoint scan over the sorted draw list, for both the INDEX path and
+//     the no-index (dirtyRect) fallback, over a large fuzz sweep.
+//   - zero-alloc INCLUDING the pick path: HOT_FRAMES of frame()+pick() through
+//     measureOps(stabilize:'deep') at maxMajor 0 / maxPauseMs<=4 /
+//     maxArrayBuffersGrowth 0, and measureAllocs at 0 B/op.
+function buildPickStage(count, withIndex) {
+  const stage = createStage(makeCtx(), {
+    maxNodes: count, width: 800, height: 600,
+    camera: { theta: 0, phi: Math.PI / 2, radius: 12, near: 0.5, far: 200 },
+  });
+  stage.dirtyRect = true;                              // no-index fallback needs the box lane
+  const gid = stage.geometry(geometry.box(1, 1, 1));
+  const mid = stage.material(material({ r: 200, g: 120, b: 90 }));
+  let seed = 24681357;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  for (let i = 0; i < count; i++) {
+    stage.addNode(gid, mid, { x: (rnd() - 0.5) * 10, y: (rnd() - 0.5) * 7, z: (rnd() - 0.5) * 8 });
+  }
+  let tree = null;
+  if (withIndex) { tree = new DynamicBVH2D(count * 2 + 1); stage.useSpatialIndex(tree, { margin: 0.5 }); }
+  return { stage, tree };
+}
+
+// Brute-force topmost oracle: independent of pick(), reads only the public draw
+// list + box lane. Must equal pick() exactly (with and without an index).
+function pickOracle(stage, x, y) {
+  const order = stage._order, dc = stage._drawCount, box = stage._draw.box, dn = stage._draw.node;
+  for (let i = dc - 1; i >= 0; i--) {
+    const d = dn[order[i]], j = d << 2;
+    if (x >= box[j] && x <= box[j + 2] && y >= box[j + 1] && y <= box[j + 3]) return d;
+  }
+  return -1;
+}
+
+async function phaseE() {
+  const PICK_N = 512;
+  const idx = buildPickStage(PICK_N, true);
+  const noidx = buildPickStage(PICK_N, false);
+  idx.stage.frame(DT); noidx.stage.frame(DT);
+  if (idx.stage._drawCount <= 0) die('phaseE: indexed stage produced an empty draw list');
+  if (!idx.tree.validate()) die('phaseE: bound tree invalid after first frame');
+
+  // Differential fuzz: pick == oracle for BOTH paths.
+  const out = new Int32Array(1);
+  let seed = 13579, hits = 0;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  for (let i = 0; i < 6000; i++) {
+    const x = rnd() * 800, y = rnd() * 600;
+    const gi = idx.stage.pick(x, y, out); const goti = gi > 0 ? out[0] : -1;
+    if (goti !== pickOracle(idx.stage, x, y)) die('phaseE: indexed pick != oracle at (' + x + ',' + y + ')');
+    const gn = noidx.stage.pick(x, y, out); const gotn = gn > 0 ? out[0] : -1;
+    if (gotn !== pickOracle(noidx.stage, x, y)) die('phaseE: no-index pick != oracle at (' + x + ',' + y + ')');
+    if (goti >= 0) hits++;
+  }
+  if (hits < 100) die('phaseE: pick fuzz never hit a node (hits=' + hits + ')');
+
+  // Round trip: tree conserved across HOT_FRAMES (no realloc under clear()+insert).
+  const before = {
+    maxNodes: idx.tree.maxNodes,
+    bboxes: idx.tree.bboxes.byteLength, parents: idx.tree.parents.byteLength,
+    children: idx.tree.children.byteLength, userData: idx.tree.userData.byteLength,
+  };
+
+  // Zero-alloc INCLUDING pick: step frame() then a pick() every iteration.
+  const pk = new Int32Array(1);
+  let acc = 0;
+  const res = measureOps(function () {
+    const s = idx.stage.frame(DT);
+    acc = acc + s.facesDrawn + idx.stage.pick(400, 300, pk);
+  }, { ops: HOT_FRAMES, warmup: 8, source: 'gc', stabilize: 'deep' });
+  if (!Number.isFinite(acc) || acc <= 0) die('phaseE: frame+pick loop produced no work (acc=' + acc + ')');
+
+  if (idx.tree.maxNodes !== before.maxNodes) die('phaseE: tree.maxNodes changed across frames');
+  if (idx.tree.bboxes.byteLength !== before.bboxes || idx.tree.parents.byteLength !== before.parents ||
+      idx.tree.children.byteLength !== before.children || idx.tree.userData.byteLength !== before.userData) {
+    die('phaseE: a tree backing byteLength changed across frames -- clear()+insertLeaves reallocated');
+  }
+  if (!idx.tree.validate()) die('phaseE: tree invalid after ' + HOT_FRAMES + ' frames');
+  const report = checkNoGc(res.summary, RULES);
+
+  const idx2 = buildPickStage(PICK_N, true);
+  idx2.stage.frame(DT);
+  const pk2 = new Int32Array(1);
+  let acc2 = 0;
+  const alloc = measureAllocs(function () {
+    idx2.stage.frame(DT);
+    acc2 = acc2 + idx2.stage.pick(400, 300, pk2);
+  }, { iterations: 4096, warmup: 16 });
+  if (!Number.isFinite(acc2)) die('phaseE: alloc probe produced non-finite acc');
+
+  // Retention (A6): build a stage, bind an index, run a frame, DROP the index, then
+  // release the stage. A dropped index must not pin the stage (nor vice versa).
+  // Track each stage without untracking; a hard settle decides its fate. Neither
+  // NOOP nor the numeric tag closes over the stage (held-value contract).
+  const rt = createLeakTracker({ name: 'depth-index-retention' });
+  const RES_E = Math.max(16, (CYCLES / 1000) | 0);
+  for (let cycle = 0; cycle < CYCLES; cycle++) {
+    const b = buildPickStage(32, true);
+    b.stage.frame(DT);
+    b.stage.dropSpatialIndex();
+    rt.track(b.stage, NOOP, cycle);
+  }
+  await settleHard();
+  const residual = rt.size();
+  const findings = rt.audit().length;
+
+  return { report, bytesPerCall: alloc.bytesPerCall, hits, residual, findings, RES_E };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -420,18 +543,21 @@ async function main() {
   const b = phaseB();
   const c = phaseC();
   const d = phaseD();
+  const e = await phaseE();
 
   const retentionOk = a.activeCount === 0 && a.nodesCount === 0 &&
-    a.trackerSize <= a.residualCeiling && a.findings === 0;
-  const budgetOk = b.report.ok && b.bytesPerCall === 0 && d.report.ok && d.bytesPerCall === 0;
+    a.trackerSize <= a.residualCeiling && a.findings === 0 &&
+    e.residual <= e.RES_E && e.findings === 0;
+  const budgetOk = b.report.ok && b.bytesPerCall === 0 && d.report.ok && d.bytesPerCall === 0 &&
+    e.report.ok && e.bytesPerCall === 0;
   const controlOk = c.caught;
 
   const g = b.summary.gc;
   process.stderr.write(
     'GATE leak=size ' + a.trackerSize + '/' + a.residualCeiling + ' findings=' + a.findings +
-    ' warnings=0 pinned=' + a.pinned +
+    ' warnings=0 pinned=' + a.pinned + ' pickResidual=' + e.residual + '/' + e.RES_E +
     ' | gc major=' + g.major + ' minor=' + g.minor + ' maxMs=' + g.maxMs.toFixed(2) +
-    ' | alloc=' + b.bytesPerCall + ' B/op\n');
+    ' | alloc=' + b.bytesPerCall + ' B/op pick=' + e.bytesPerCall + ' B/op\n');
 
   if (retentionOk && budgetOk && controlOk) {
     process.stdout.write('ok\n');

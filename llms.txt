@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.5.1
+# @zakkster/lite-depth v1.6.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
