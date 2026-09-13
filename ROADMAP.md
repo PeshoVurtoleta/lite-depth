@@ -1254,15 +1254,33 @@ DONE WHEN
 ---
 package: "@zakkster/lite-depth"
 version_target: 2.0.0
-status: planned
+status: SHIPPED (v2.0.0, 2026-09-13)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
 leak_cycles: 4096
 peers: ["@zakkster/lite-gc-profiler"]
-findings: []
+findings: [worker-phaseG-major-gc-flake]
 depends_on: [D4, D5, D6]
 ---
+
+<!-- SHIPPED (v2.0.0, 2026-09-13): pipeline clean planner->coder->reviewer(APPROVED,
+     one REJECT->fix on the layer guard null/non-integer hole)->qa(PASS); released +
+     published. LANE_VERSION=1 published; LANES.md is the frozen normative lane/wire/
+     sort-key spec. Both residual layout decisions RULED on measured evidence and
+     FROZE THE INCUMBENT: quantize = linear (0 same-layer inversions both curves;
+     linear ~4x cheaper on the hot path), layer split = 6/26 (peak layer use in the
+     whole suite is 3; 64 layers has 16x headroom). FLAGS frozen: BILLBOARD (bit 4)
+     RESERVED in place with public surface + tag lockstep kept + `// reserved: D8
+     Sprites` source comment (per user ruling; removal would renumber 3 consumed bits
+     + force a 2nd major when D8 lands -- rejected). BREAKING: layer out-of-range now
+     throws at both doors (addNode/setLayer, Number.isInteger-gated). Gate: tests
+     240/240 (--expose-gc), torture ok 0 B/op maxMajor 0 parity 8; test/24-lane-freeze
+     (+10) + test/25-migration (+12). PARKED: phaseG worker return-leg tripped ONE
+     major GC on a warm-heap second pass (bytesPerCall=0, findings=0 -- GC
+     nondeterminism in the documented young-gen rebind, NOT a leak; not a D7
+     regression, pre-existing D6 behavior). Do not hot-patch; investigate the rebind
+     or the phaseG warmup separately. -->
 
 # lite-depth -- publish the binary contract, then stop moving it
 

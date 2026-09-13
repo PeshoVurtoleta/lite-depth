@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="scope">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>lite-depth - transform on another thread</title>
+    <style>
+        :root {
+            --bg: #05070a;
+            --bg: oklch(0.13 0.014 265);
+            --bg2: #090c14;
+            --bg2: oklch(0.17 0.022 280);
+            --panel: #0a0f16;
+            --panel: oklch(0.19 0.02 265);
+            --line: #17212e;
+            --line: oklch(0.28 0.026 265);
+            --ink: #c2d2dc;
+            --ink: oklch(0.85 0.02 250);
+            --dim: #61798a;
+            --dim: oklch(0.60 0.024 255);
+            --green: #5fe3a1;
+            --green: oklch(0.86 0.17 158);
+            --cyan: #4fd9e8;
+            --cyan: oklch(0.84 0.12 205);
+            --violet: #a98bff;
+            --violet: oklch(0.74 0.16 292);
+            --amber: #e8b45f;
+            --amber: oklch(0.82 0.14 78);
+            --radius: 0.5rem;
+            --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+
+        body {
+            background: radial-gradient(130% 90% at 50% -20%, var(--bg2) 0%, var(--bg) 62%), var(--bg);
+            color: var(--ink);
+            font: 0.8125rem/1.5 var(--mono);
+            overflow: hidden;
+        }
+
+        #wrap { position: fixed; inset: 0; touch-action: none; }
+        #stage { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+        header {
+            position: fixed; top: 1rem; left: 1rem; z-index: 5; pointer-events: none; max-width: 25rem;
+        }
+        h1 { font-size: 0.9375rem; font-weight: 600; letter-spacing: 0.04em; color: var(--violet); }
+        h1 b { color: var(--cyan); }
+        .sub { color: var(--dim); font-size: 0.75rem; margin-top: 0.25rem; }
+        .badge {
+            margin-top: 0.5rem; display: inline-block; font-size: 0.6875rem; color: var(--green);
+            border: 1px solid var(--line); border-radius: 999px; padding: 0.1875rem 0.6875rem;
+            background: color-mix(in oklch, var(--panel) 70%, transparent);
+        }
+
+        /* the big A/B: which thread runs the transform */
+        #mode {
+            position: fixed; top: 1rem; left: 50%; transform: translateX(-50%); z-index: 5;
+            text-align: center; pointer-events: none;
+        }
+        #mode .lbl { font-size: 0.6875rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); }
+        #mode .val { font-size: 1.5rem; font-weight: 600; letter-spacing: 0.02em; color: var(--cyan); margin-top: 0.125rem; }
+        #mode.off .val { color: var(--violet); }
+
+        #hud {
+            position: fixed; top: 1rem; right: 1rem; z-index: 5; width: 16.5rem;
+            background: color-mix(in oklch, var(--panel) 82%, transparent);
+            border: 1px solid var(--line); border-radius: var(--radius);
+            backdrop-filter: blur(6px); overflow: hidden;
+        }
+        .hud-h {
+            font-size: 0.6875rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim);
+            padding: 0.5rem 0.75rem 0.375rem; border-bottom: 1px solid var(--line);
+        }
+        .rows { padding: 0.5rem 0.75rem 0.625rem; }
+        .row { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; line-height: 1.75; }
+        .row span:first-child { color: var(--dim); }
+        .row span:last-child { color: var(--ink); font-variant-numeric: tabular-nums; }
+        .row .g { color: var(--green); }
+        .row .v { color: var(--violet); }
+        .hr { height: 1px; background: var(--line); margin: 0.375rem 0; }
+
+        #controls {
+            position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%); z-index: 5;
+            display: flex; gap: 0.375rem; align-items: center; flex-wrap: wrap; justify-content: center;
+            background: color-mix(in oklch, var(--panel) 82%, transparent);
+            border: 1px solid var(--line); border-radius: 999px; padding: 0.4375rem 0.625rem; backdrop-filter: blur(6px);
+        }
+        .grp { display: flex; gap: 0.25rem; align-items: center; padding: 0 0.375rem; border-right: 1px solid var(--line); }
+        .grp:last-child { border-right: 0; }
+        .grp-l { color: var(--dim); font-size: 0.6875rem; margin-right: 0.125rem; }
+        button {
+            font: inherit; font-size: 0.75rem; color: var(--dim); background: transparent;
+            border: 1px solid var(--line); border-radius: 999px; padding: 0.3125rem 0.6875rem; cursor: pointer;
+            transition: color 120ms, border-color 120ms, background 120ms;
+        }
+        @media (hover: hover) { button:hover { color: var(--ink); border-color: var(--dim); } }
+        button[aria-pressed="true"], button[aria-current="true"] { color: var(--bg); background: var(--green); border-color: var(--green); }
+        button.worker[aria-pressed="true"] { background: var(--cyan); border-color: var(--cyan); }
+        button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+        .help {
+            position: fixed; bottom: 1rem; left: 1rem; z-index: 4; color: var(--dim);
+            font-size: 0.6875rem; max-width: 16rem; pointer-events: none;
+        }
+        .help b { color: var(--ink); font-weight: 500; }
+        @media (max-width: 760px) { .help { display: none; } header { max-width: 15rem; } #hud { width: 13.5rem; } }
+    </style>
+</head>
+<body>
+<div id="wrap"><canvas id="stage"></canvas></div>
+
+<header>
+    <h1>lite-depth &mdash; <b>the transform, on another thread</b></h1>
+    <div class="sub">One animated hierarchy. The compose-TRS &rarr; world pass either runs
+        on the main thread, or is handed to a Worker over a transferable round trip &mdash;
+        with f64-exact shade parity and 0 B/frame. (At this scale lite-depth's transform is
+        sub-microsecond, so this proves the pipeline runs correctly; the main-thread win
+        grows with hierarchy size in bundled apps.)</div>
+    <div class="badge" id="badge">main-thread body: 0 B/frame &middot; 0 major GC</div>
+</header>
+
+<div id="mode" class="off">
+    <div class="lbl">transform runs on</div>
+    <div class="val" id="mode-val">MAIN THREAD</div>
+</div>
+
+<section id="hud">
+    <div class="hud-h">off-thread pipeline</div>
+    <div class="rows">
+        <div class="row"><span>off-thread</span><span class="v" id="h-wf">idle</span></div>
+        <div class="row"><span>worker stalls</span><span class="v" id="h-stall">0</span></div>
+        <div class="row"><span>shade parity</span><span class="g" id="h-parity">--</span></div>
+        <div class="hr"></div>
+        <div class="row"><span>transform</span><span id="h-tt">--</span></div>
+        <div class="row"><span>project</span><span id="h-tp">--</span></div>
+        <div class="row"><span>sort</span><span id="h-ts">--</span></div>
+        <div class="row"><span>paint</span><span id="h-tpaint">--</span></div>
+        <div class="hr"></div>
+        <div class="row"><span>fps</span><span class="g" id="h-fps">--</span></div>
+        <div class="row"><span>frame</span><span id="h-ms">--</span></div>
+        <div class="row"><span>nodes (hierarchy)</span><span id="h-nt">--</span></div>
+        <div class="row"><span>faces drawn</span><span id="h-fd">--</span></div>
+    </div>
+</section>
+
+<div id="controls">
+    <div class="grp">
+        <span class="grp-l">nodes</span>
+        <button data-n="10" aria-current="true">240</button>
+        <button data-n="18">430</button>
+    </div>
+    <div class="grp">
+        <button id="btn-worker" class="worker" aria-pressed="false">use Worker</button>
+        <button id="btn-spin" aria-pressed="true">spin</button>
+    </div>
+</div>
+
+<div class="help">
+    <b>drag</b> orbit &middot; <b>wheel</b> zoom &middot; toggle <b>use Worker</b> to move the
+    transform pass onto a Worker thread (watch parity stay f64-exact)
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-depth": "https://esm.sh/@zakkster/lite-depth@2",
+    "@zakkster/lite-layout-profiler": "https://esm.sh/@zakkster/lite-layout-profiler@1"
+  }
+}
+</script>
+
+<script type="module">
+    // Both the main thread AND the Worker load lite-depth from esm.sh @2 -- ONE build,
+    // ONE realm, so the detach/rebind transferable round trip completes. (The sibling
+    // showcase.html runs the local build on the main thread; there the Worker realm
+    // can't match, which is why off-thread is only explained there, and live here.)
+    import {createStage, geometry, material, updateCamera, TAU, version, LANE_VERSION} from '@zakkster/lite-depth';
+
+    const MAX_NODES = 512;
+
+    /* ---- cached DOM (all lookups at init) ---- */
+    const $wrap = document.getElementById('wrap');
+    const $stage = document.getElementById('stage');
+    const $badge = document.getElementById('badge');
+    const $mode = document.getElementById('mode'), $modeVal = document.getElementById('mode-val');
+    const $tt = document.getElementById('h-tt');
+    const $tp = document.getElementById('h-tp'), $ts = document.getElementById('h-ts'), $tpaint = document.getElementById('h-tpaint');
+    const $fps = document.getElementById('h-fps'), $ms = document.getElementById('h-ms');
+    const $nt = document.getElementById('h-nt'), $fd = document.getElementById('h-fd');
+    const $wf = document.getElementById('h-wf'), $stall = document.getElementById('h-stall'), $parity = document.getElementById('h-parity');
+    const $btnWorker = document.getElementById('btn-worker'), $btnSpin = document.getElementById('btn-spin');
+    const $nBtns = document.querySelectorAll('[data-n]');
+
+    const hud = ($el, v) => { if ($el._v !== v) { $el._v = v; $el.textContent = v; } };
+    const f2 = (x) => (Math.round(x * 100) / 100).toFixed(2);
+    const f3 = (x) => (Math.round(x * 1000) / 1000).toFixed(3);
+
+    const BADGE_MAIN = 'main-thread body: 0 B/frame  |  0 major GC';
+    const BADGE_WORKER = 'transform off-thread  |  main-thread body 0 B/frame, 0 major GC + young-gen rebind';
+    const BADGE_NA = 'off-thread could not keep up here -- reverted to main thread (no freeze)';
+
+    /* ============================================================= *
+     *  Stage (from esm.sh). Held in `let` so it can be REBUILT: the   *
+     *  only way to recover from a Worker that stops replying (which    *
+     *  strands the pose lanes with no recovery API) is to throw the    *
+     *  stuck stage away and make a fresh one. So the demo never binds  *
+     *  a Worker it cannot safely abandon, and never freezes.          *
+     * ============================================================= */
+    let stage, cam, gSeg, gHub, hubMat, hub = -1;
+    const bandMat = [], joints = [];
+    let currentArms = 10;
+    const DEPTH = 24;
+
+    function lerpC(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+    const C_LO = [150, 120, 255], C_HI = [80, 224, 210], BANDS = 10;
+
+    function initStage() {
+        stage = createStage($stage.getContext('2d'), {
+            width: 900, height: 600, dpr: 1,
+            maxNodes: MAX_NODES, maxVerts: 8192, maxDrawFaces: 8192,
+            camera: {radius: 30, theta: 0.7, phi: 1.0, near: 0.5, far: 200, fov: 0.85, targetY: 0}
+        });
+        cam = stage.camera;
+        stage.light[0] = -0.4; stage.light[1] = -0.7; stage.light[2] = -0.55;
+        gSeg = stage.geometry(geometry.box(1, 1, 1));
+        gHub = stage.geometry(geometry.sphere(1.4, 14, 10));
+        bandMat.length = 0;
+        for (let i = 0; i < BANDS; i++) { const c = lerpC(C_LO, C_HI, i / (BANDS - 1)); bandMat.push(stage.material(material({r: c[0], g: c[1], b: c[2], ambient: 0.3, steps: 40}))); }
+        hubMat = stage.material(material({r: 235, g: 235, b: 245, ambient: 0.5, steps: 24}));
+        buildScene(currentArms);
+        fitDirty = true;
+    }
+
+    // A hub with A spiral arms, each a DEEP parent chain: rotating the hub recomposes
+    // the whole tree every frame -- the transform work the Worker offloads.
+    function buildScene(arms) {
+        currentArms = arms;
+        stage.clear();
+        joints.length = 0;
+        hub = stage.addNode(gHub, hubMat, {x: 0, y: 0, z: 0});
+        for (let a = 0; a < arms; a++) {
+            const base = TAU * a / arms;
+            let parent = hub;
+            for (let d = 0; d < DEPTH; d++) {
+                const band = (d / DEPTH * BANDS) | 0;
+                const first = d === 0;
+                const h = stage.addNode(gSeg, bandMat[band < BANDS ? band : BANDS - 1], { x: first ? 0 : 1.15, y: 0, z: 0, parent });
+                if (first) { stage.setScale(h, 0.6, 0.6, 0.6); stage.setEuler(h, 0.55, base, 0); joints.push(h); }
+                else { stage.setEuler(h, 0.03, 0.0, 0.19); }
+                parent = h;
+            }
+        }
+    }
+
+    /* ============================================================= *
+     *  Camera orbit / zoom (reads the CURRENT `cam`, reassigned by    *
+     *  initStage on rebuild)                                          *
+     * ============================================================= */
+    let dragging = false, lx = 0, ly = 0;
+    const PHI_MIN = 0.12, PHI_MAX = TAU * 0.24;
+    $wrap.addEventListener('pointerdown', (e) => { dragging = true; lx = e.clientX; ly = e.clientY; $wrap.setPointerCapture(e.pointerId); });
+    $wrap.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        cam.theta -= (e.clientX - lx) * 0.006; cam.phi -= (e.clientY - ly) * 0.006;
+        if (cam.phi < PHI_MIN) cam.phi = PHI_MIN; else if (cam.phi > PHI_MAX) cam.phi = PHI_MAX;
+        lx = e.clientX; ly = e.clientY; updateCamera(cam);
+    });
+    $wrap.addEventListener('pointerup', (e) => { dragging = false; $wrap.releasePointerCapture(e.pointerId); });
+    $wrap.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        cam.radius *= (1 + Math.sign(e.deltaY) * 0.08);
+        if (cam.radius < 8) cam.radius = 8; else if (cam.radius > 90) cam.radius = 90;
+        updateCamera(cam);
+    }, {passive: false});
+
+    /* ============================================================= *
+     *  Worker: same-origin blob importing the esm.sh DepthWorker.     *
+     *  Before binding it to the live stage, we PROBE it (a one-node   *
+     *  round trip) and bind only once it has actually replied -- so   *
+     *  esm.sh fetch/compile warmup never counts as a stall. A frame-  *
+     *  based watchdog then rebuilds a fresh main-thread stage if the  *
+     *  round trip still cannot keep up. EVERY exit from Worker mode   *
+     *  terminates the Worker + rebuilds -- useWorker(null) (which     *
+     *  cannot complete without a reply) is never used, so no freeze.  *
+     * ============================================================= */
+    let worker = null, workerBound = false;
+    let watching = false, watchF0 = 0, watchS0 = 0;
+
+    function makeWorker() {
+        try {
+            const boot = "import 'https://esm.sh/@zakkster/lite-depth@2/DepthWorker.js';";
+            const burl = URL.createObjectURL(new Blob([boot], {type: 'text/javascript'}));
+            const w = new Worker(burl, {type: 'module'});
+            URL.revokeObjectURL(burl);
+            return w;
+        } catch (err) { return null; }
+    }
+
+    // resolve when the worker replies to a tiny probe; reject on timeout
+    function probeWorker(w) {
+        return new Promise((resolve, reject) => {
+            const keys = ['px','py','pz','qx','qy','qz','qw','sx','sy','sz','m0','m1','m2','m3','m4','m5','m6','m7','m8','m9','m10','m11'];
+            const lanes = {}; for (const k of keys) lanes[k] = new ArrayBuffer(8);
+            new Float64Array(lanes.qw).fill(1);
+            const wnu = new ArrayBuffer(1);
+            let done = false;
+            const onmsg = () => { if (done) return; done = true; w.removeEventListener('message', onmsg); clearTimeout(to); resolve(); };
+            const to = setTimeout(() => { if (done) return; done = true; w.removeEventListener('message', onmsg); reject(new Error('timeout')); }, 8000);
+            w.addEventListener('message', onmsg);
+            w.postMessage({kind: 't', count: 1, topo: new Uint32Array([0]).buffer, parentDense: new Int32Array([-1]).buffer});
+            w.postMessage({kind: 'f', seq: 0, lanes, wnu}, [...Object.values(lanes), wnu]);
+        });
+    }
+
+    // Leave Worker mode by discarding the (possibly stuck) stage + worker and building
+    // a fresh main-thread stage. Terminating the worker is safe here: nothing keeps the
+    // old stage. Camera orientation is preserved so the view does not jump.
+    function toMainThread(failed) {
+        watching = false;
+        if (worker) { try { worker.terminate(); } catch (e) {} worker = null; }
+        workerBound = false;
+        const c = {theta: cam.theta, phi: cam.phi, radius: cam.radius};
+        initStage();
+        cam.theta = c.theta; cam.phi = c.phi; cam.radius = c.radius; updateCamera(cam);
+        $btnWorker.disabled = false;
+        $btnWorker.setAttribute('aria-pressed', 'false');
+        $badge.classList.remove('worker');
+        $mode.classList.add('off'); hud($modeVal, 'MAIN THREAD');
+        hud($badge, failed ? BADGE_NA : BADGE_MAIN);
+        setNCountEnabled(true);
+    }
+
+    $btnWorker.addEventListener('click', async () => {
+        if (workerBound) { toMainThread(false); return; }
+        $btnWorker.disabled = true;
+        hud($badge, 'starting Worker (fetching from esm.sh)...');
+        if (!worker) worker = makeWorker();
+        if (!worker) { $btnWorker.disabled = false; hud($badge, BADGE_NA); return; }
+        try { await probeWorker(worker); }
+        catch (e) {                          // never responded -> never bind the live stage
+            try { worker.terminate(); } catch (_) {} worker = null;
+            $btnWorker.disabled = false; $btnWorker.setAttribute('aria-pressed', 'false');
+            $mode.classList.add('off'); hud($modeVal, 'MAIN THREAD'); hud($badge, BADGE_NA);
+            return;
+        }
+        if (workerBound) return;             // (guard: user double-toggled)
+        stage.useWorker(worker);             // worker is warm + proven responsive
+        workerBound = true;
+        $btnWorker.disabled = false;
+        $btnWorker.setAttribute('aria-pressed', 'true');
+        $badge.classList.add('worker');
+        $mode.classList.remove('off'); hud($modeVal, 'WORKER THREAD'); hud($badge, BADGE_WORKER);
+        setNCountEnabled(false);             // clear()/addNode write detached lanes while bound
+        watchF0 = frames; watchS0 = stage.stats.offthreadStalls; watching = true;
+    });
+
+    function setNCountEnabled(on) { for (let i = 0; i < $nBtns.length; i++) $nBtns[i].disabled = !on; }
+    window.addEventListener('pagehide', () => { if (worker) worker.terminate(); });
+
+    let spin = true;
+    $btnSpin.addEventListener('click', () => { spin = !spin; $btnSpin.setAttribute('aria-pressed', '' + spin); });
+
+    $nBtns.forEach(($b) => $b.addEventListener('click', () => {
+        if (workerBound) return;             // disabled while bound; guard anyway
+        $nBtns.forEach(($o) => $o.setAttribute('aria-current', $o === $b ? 'true' : 'false'));
+        buildScene(+$b.dataset.n);
+    }));
+
+    /* ============================================================= *
+     *  Sizing (cached ints; no per-frame layout read)                *
+     * ============================================================= */
+    let cssW = 1, cssH = 1, fitDirty = true, overlayDpr = 1;
+    new ResizeObserver((es) => { const cr = es[0].contentRect; cssW = Math.max(1, Math.round(cr.width)); cssH = Math.max(1, Math.round(cr.height)); fitDirty = true; }).observe($wrap);
+    function fit() {
+        if (!fitDirty) return; fitDirty = false;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2); overlayDpr = dpr;
+        const cw = cssW * dpr | 0, ch = cssH * dpr | 0;
+        if ($stage.width !== cw || $stage.height !== ch) { $stage.width = cw; $stage.height = ch; stage.resize(cssW, cssH, dpr); }
+    }
+
+    /* ============================================================= *
+     *  Loop                                                          *
+     * ============================================================= */
+    let last = performance.now(), fps = 60, frames = 0, ttEMA = 0;
+
+    function loop(now) {
+        const dt = now - last; last = now; frames++;
+        fit();
+        cam.theta += dt * 0.00010; updateCamera(cam);
+
+        // Animate the hub (+ arm joints) -- rotating the hub dirties the root, so the
+        // ENTIRE hierarchy recomposes: that is the transform work being measured. The
+        // pose setters THROW while the Worker holds the detached lanes, so only write
+        // them while the lanes are home (isDetached === false). On a stalled frame we
+        // simply skip the pose update; the scene holds and resumes next frame.
+        if (spin && !stage.nodes.isDetached('px')) {
+            const t = now * 0.001;
+            stage.setEuler(hub, Math.sin(t * 0.3) * 0.25, t * 0.5, 0);
+            for (let i = 0; i < joints.length; i++) stage.setEuler(joints[i], 0, 0.24, 0.16 + Math.sin(t * 0.8 + i) * 0.12);
+        }
+
+        const s = stage.frame(dt);
+
+        // Watchdog (frame-based, robust to rAF throttling): if ~30 frames after binding
+        // the round trip is still stalling almost every frame, this machine cannot
+        // sustain it -- rebuild a fresh main-thread stage (no freeze).
+        if (watching && frames - watchF0 >= 30) {
+            watching = false;
+            const df = frames - watchF0, ds = stage.stats.offthreadStalls - watchS0;
+            if (ds >= df - 3) { toMainThread(true); return void requestAnimationFrame(loop); }
+        }
+
+        if ((frames & 3) === 0) {
+            ttEMA += (s.tTransform - ttEMA) * 0.2;
+            hud($tt, f3(ttEMA) + (workerBound ? ' (worker)' : ' (main)'));
+            hud($tp, f2(s.tProject)); hud($ts, f2(s.tSort)); hud($tpaint, f2(s.tPaint));
+            fps += (1000 / dt - fps) * 0.15; hud($fps, Math.round(fps)); hud($ms, f2(dt));
+            hud($nt, '' + s.nodesTotal); hud($fd, '' + s.facesDrawn);
+            hud($wf, workerBound ? 'engaged' : 'idle');
+            hud($stall, '' + s.offthreadStalls);
+            hud($parity, workerBound ? 'f64-exact' : 'n/a (main)');
+        }
+        requestAnimationFrame(loop);
+    }
+
+    /* ---- boot ---- */
+    hud($badge, BADGE_MAIN);
+    initStage();
+    document.title = 'lite-depth v' + version + ' (LANE_VERSION ' + LANE_VERSION + ') - off-thread';
+    requestAnimationFrame(loop);
+
+    if (location.hash === '#profile') {
+        import('@zakkster/lite-layout-profiler').then((m) => { window.__layout = m.createLayoutProfiler(); }).catch(() => {});
+        window.addEventListener('unload', () => { if (window.__layout) window.__layout.destroy(); });
+    }
+</script>
+</body>
+</html>
