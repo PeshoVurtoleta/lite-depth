@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.6.0
+# @zakkster/lite-depth v1.7.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -31,10 +31,22 @@ depend on). createStage asserts it === 1 and throws if the peer ever drifts.
 
 ## createStage(ctx, opts) -> Stage
 
-opts: { width, height, dpr, maxNodes, maxVerts, maxDrawFaces, camera }
+opts: { width, height, dpr, maxNodes, maxVerts, maxDrawFaces, maxClipVerts,
+        camera, checked }
+- checked (dev only, default false): forwards to lite-arena's checked Arena --
+  idx() validates liveness/membership and join/joinN hand back a staleness-guarded
+  plan that THROWS on a stale read or a set that is both required + excluded
+  (surfaces a consumer interleaving its own arena joins with a lite-depth pass). The
+  unchecked default path is byte-identical, so production frame() cost is unchanged.
 - maxVerts = TOTAL projected vertices across all visible instances per frame
   (sphere(_,10,6) = 77 verts, box = 8). Undersizing silently drops geometry.
-- maxDrawFaces = total draw-face budget per frame.
+- maxDrawFaces = total draw-face budget per frame. A SHADOW-CASTING node counts
+  TWICE: once for its own faces, once for the flat ground-shadow faces it emits
+  (D5). Size for (visible faces + shadow-caster faces) or shadows fail closed
+  (facesOverflowed) once the budget fills.
+- maxClipVerts = per-FRAME screen-vertex scratch budget shared by the near-plane
+  clip AND the D5 shadow pass (both store explicit-vertex polygons). Default 4096.
+  This is NOT the per-face vertex cap: that is the fixed CLIP_CAP=16 constant.
 - camera: { fov, near, far, ortho, orthoScale, theta, phi, radius,
   targetX/Y/Z }.
 
@@ -68,7 +80,8 @@ fill:false + stroke gives a wireframe; fill:true + stroke gives fill-then-outlin
 
 ## Nodes (Stage methods; h = generational NodeHandle)
 
-    h = stage.addNode(geomId, matId, { x, y, z, layer, parent })
+    h = stage.addNode(geomId, matId, { x, y, z, layer, parent,
+                                       pickable, castShadow, billboard })
     stage.setPosition(h, x, y, z)
     stage.setScale(h, x, y?, z?)           // uniform if y/z omitted
     stage.setQuaternion(h, x, y, z, w)
@@ -77,6 +90,9 @@ fill:false + stroke gives a wireframe; fill:true + stroke gives fill-then-outlin
     stage.setLayer(h, 0..63)               // high bits of the sort key
     stage.setDepthBias(h, bias)            // added to viewZ before quantize (popping fix)
     stage.setVisible(h, bool)
+    stage.setPickable(h, bool)             // D5: bit + Pickable tag in lockstep
+    stage.setCastShadow(h, bool)           // D5: bit + ShadowCaster tag in lockstep
+    stage.setBillboard(h, bool)            // D5: bit + Billboard tag (tag reserved; see below)
     stage.remove(h)                        // generational: stale handle invalidates
     stage.resize(w, h, dpr?)
 Stale handles after remove() are safe: isAlive(h) is false, never aliases a
@@ -115,7 +131,10 @@ matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
     //                          // inherited-only descendants are shaded via the
     //                          // inverse-transpose too but are not counted here
     //       nodesOrphaned,     // nodes whose dead parent forced a ROOT reparent
-    //       nodesTotal }       // live node count this frame
+    //       nodesTotal,        // live node count this frame
+    //       shadowFacesDrawn } // D5: flat ground-shadow faces painted this frame,
+    //                          // counted APART from facesDrawn so a caster is never
+    //                          // double-counted (its own faces stay in facesDrawn)
 
 ## Per-node screen cull + dirty-rect (v1.5.0)
 
@@ -139,6 +158,92 @@ during projection. If that box misses the viewport the whole node is culled
                                 // delta (repaint sceneBox U prevSceneBox)
 Bounds are rounded OUTWARD to f32 so the stored box never clips the true box.
 Grown in lockstep by stage.reserve(n).
+
+## Near-plane clip (v1.6.0 / D4)
+
+    stage.clipNear = true;      // ON by default. A face straddling the near plane is
+                                // Sutherland-Hodgman-clipped against z=-near and drawn.
+                                // Set false to restore v1.5.1 (a straddling face is
+                                // near-culled whole). Cold straddle path only -- the
+                                // fully-front fast path is byte-identical either way.
+Per-face vertex cap is CLIP_CAP=16 (a >=16-vert face straddling near is rejected
+whole, fail closed). Clip scratch is LAZY: allocated on the first straddle, so a
+scene that never straddles keeps the smaller footprint. Budget is maxClipVerts.
+
+## Screen-space picking (v1.6.0 / D4; post-projection, NOT a 3D raycast)
+
+Picks read the per-node screen-box lane, so they REQUIRE the box lane populated:
+either a bound spatial index (forces it on) or dirtyRect=true. Fail closed otherwise
+(a stale lane would return a phantom hit).
+
+    stage.pick(x, y, out)            // topmost node under a point. Returns 1 + writes
+                                     // the dense index to out[0], or 0. Walks the
+                                     // sorted draw list back-to-front (last painted =
+                                     // nearest); with an index, queryPoint prunes to
+                                     // broadphase candidates first.
+    stage.pickRect(x0,y0,x1,y1,out)  // dense indices whose box overlaps the rect ->
+                                     // out; returns count (clamped to out.length).
+    stage.pickRay(p0x,p0y,p1x,p1y,out) // dense indices whose box the segment crosses
+                                     // -> out; returns count. Non-finite ends -> 0.
+    stage.nearest(x, y, radius)      // nearest node whose box is within radius px, or
+                                     // -1. Squared-distance test, no Math.sqrt.
+    stage.picked                     // last picked dense index (-1 = none)
+    stage.onPick = (id, ev) => {}    // optional pick callback for the pointer plumbing
+    stage.attachPointer(el)          // pointerdown/move/up -> pick(); returns stage
+    stage.detachPointer(el)          // remove the listeners; returns stage
+All pick paths are zero-alloc (caller-owned out + reused scratch).
+
+    stage.useSpatialIndex(tree, { margin })  // DI-bind a DynamicBVH2D-shaped tree
+                                     // (lite-bvh, never a runtime dep). Forces the box
+                                     // lane on; the tree is clear()+insertLeaves-rebuilt
+                                     // each frame from the node boxes (zero-alloc).
+                                     // margin: non-negative fatten. Returns stage.
+    stage.dropSpatialIndex()         // unbind; pick reverts to the dirtyRect fallback.
+
+## Layers: tags, ground shadows, pickSet (D5)
+
+D5 adds three flag-backed MEMBERSHIP tags plus a per-frame derived Culled set, all
+lite-arena registerTag() sets. Each of the three mirrors a FLAGS bit and is kept in
+lockstep on addNode / the set* setters / remove / clear -- the bit stays the hot
+per-node compare in collect, the tag turns an O(nodes) secondary scan into an
+O(members) walk for the cold passes. Pickable feeds pickSet, ShadowCaster feeds the
+shadow pass; Billboard's bit/tag are maintained but have no internal draw consumer
+yet -- RESERVED for a future billboard pass (FLAGS D-14: every FLAGS bit is either
+consumed by code or reserved with a dated milestone).
+
+    // shadows: register a dark material, tag casters, set the stage shadow material
+    const shadowMat = stage.material(material({ r: 20, g: 20, b: 24 }));
+    stage.setShadowMaterial(shadowMat);   // -1 (default) disables -> NO shadow pass
+    stage.setCastShadow(h, true);         // or addNode(..., { castShadow: true })
+Each non-culled ShadowCaster's faces are flatten-projected onto the world plane y=0
+along stage.light, then appended to the SAME draw list as DRAW_SHADOW polygons.
+Ordering (so the caster paints over its own shadow, no real-face key changed):
+- caster at layer L >= 1: shadow goes to layer L-1 -- the layer bits alone put it
+  strictly under the caster regardless of depth; within layer L-1 shadows sort by
+  their ground-projected depth.
+- caster at layer 0 (default): there is no layer below, so every layer-0 shadow is
+  keyed at the caster's FARTHEST view-space extent (bounding-sphere far point) minus
+  one depth unit -- strictly below every one of that caster's real face keys (a face
+  centroid is never farther than the bounding sphere; quantize is monotonic). It thus
+  sorts at (just below) the caster's far depth within layer 0.
+shadowFacesDrawn counts shadow faces apart from facesDrawn. Fail closed: a light parallel to the ground casts no
+shadow; a culled or invisible caster casts nothing. Flatten-matrix onto ONE plane --
+NOT shadow maps, NOT soft shadows. With NO shadow material set, the draw output is
+byte-identical to 1.6.0 (matOverride[e] === the node material for every fill).
+
+    stage.pickSet(out)               // pickable, non-culled dense indices -> out;
+                                     // returns count (clamped to out.length). Bounds
+                                     // a pick broadphase to the pickable set via
+                                     // joinN([Pickable],[Culled]). Call after frame();
+                                     // Culled reflects the most recent frame. 0 alloc.
+
+PLAN-REUSE CONTRACT (lite-arena shared scratch): lite-depth calls arena.joinN at
+most ONCE per pass (shadow pass; pickSet) and consumes the reused plan IMMEDIATELY,
+never retaining it. A consumer that calls arena.joinN on the SAME arena mid-frame
+(between lite-depth reading the plan and finishing the pass) invalidates lite-depth's
+plan -- so do not interleave your own joins with a frame in progress. The plan and
+its others/excl arrays are arena-owned reused scratch; loop to count/exclCount,
+never .length.
 
 ## Camera
 

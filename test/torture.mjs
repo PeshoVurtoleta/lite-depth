@@ -532,6 +532,73 @@ async function phaseE() {
   return { report, bytesPerCall: alloc.bytesPerCall, hits, residual, findings, RES_E };
 }
 
+// --- Phase F: D5 layers -- tags + shadow pass + pickSet zero-alloc ------------
+//
+// D5 "Layers". A dense down-z stage where every node is a ShadowCaster AND every
+// third is Pickable, with a stage shadow material set. Each frame therefore runs
+// the FULL D5 cold machinery -- syncCulled (O(members)) reconciling Culled from the
+// cull stamps, the flat ground-shadow pass (joinN([ShadowCaster],[Culled]) consumed
+// immediately, flatten-project + append DRAW_SHADOW polygons), and a post-frame
+// pickSet (joinN([Pickable],[Culled])). It gates that ALL of it stays 0 major/minor
+// GC and 0 bytes/op: the joinN plans are arena-owned reused scratch, the tag walks
+// are index-only, and the shadow polys reuse the clip scratch. If any of those
+// allocated per frame, this phase lights up maxArrayBuffersGrowth / bytesPerCall.
+function buildLayersStage(count) {
+  const stage = createStage(makeCtx(), {
+    maxNodes: count, width: 800, height: 600,
+    camera: { theta: 0.5, phi: 0.9, radius: 30, near: 0.5, far: 200 },
+  });
+  stage.dirtyRect = true;
+  const gid = stage.geometry(geometry.box(1, 1, 1));
+  const mid = stage.material(material({ r: 200, g: 120, b: 90 }));
+  const smid = stage.material(material({ r: 20, g: 20, b: 24 }));  // dark ground shadow
+  stage.setShadowMaterial(smid);
+  const side = Math.ceil(Math.cbrt(count));
+  for (let i = 0; i < count; i++) {
+    const gx = i % side, gy = (i / side | 0) % side, gz = (i / (side * side) | 0);
+    stage.addNode(gid, mid, {
+      x: (gx - side / 2) * 1.6, y: (gy - side / 2) * 1.6 + 4, z: (gz - side / 2) * 1.6,
+      castShadow: true, pickable: (i % 3) === 0,
+    });
+  }
+  return stage;
+}
+
+function phaseF() {
+  const LN = 512;
+  const stage = buildLayersStage(LN);
+  stage.frame(DT);
+  if (stage.stats.shadowFacesDrawn <= 0) die('phaseF: shadow pass emitted no faces -- D5 machinery not exercised');
+  if (stage._tags.ShadowCaster.count !== LN) die('phaseF: ShadowCaster tag count != node count');
+  const pset = new Int32Array(LN);
+  if (stage.pickSet(pset) <= 0) die('phaseF: pickSet returned no pickable nodes');
+  // Culled must be a strict subset of the caster/pickable members (never the scene).
+  if (stage._tags.Culled.count > stage._tags.ShadowCaster.count + stage._tags.Pickable.count) {
+    die('phaseF: Culled overpopulated -- syncCulled walked more than the tag members');
+  }
+
+  const out = new Int32Array(LN);
+  let acc = 0;
+  const res = measureOps(function () {
+    const s = stage.frame(DT);
+    acc = acc + s.facesDrawn + s.shadowFacesDrawn + stage.pickSet(out);
+  }, { ops: HOT_FRAMES, warmup: 8, source: 'gc', stabilize: 'deep' });
+  if (!Number.isFinite(acc) || acc <= 0) die('phaseF: layers frame+pickSet loop produced no work (acc=' + acc + ')');
+  const report = checkNoGc(res.summary, RULES);
+
+  const stage2 = buildLayersStage(LN);
+  stage2.frame(DT);
+  const out2 = new Int32Array(LN);
+  let acc2 = 0;
+  const alloc = measureAllocs(function () {
+    const s = stage2.frame(DT);
+    acc2 = acc2 + s.shadowFacesDrawn + stage2.pickSet(out2);
+  }, { iterations: 4096, warmup: 16 });
+  if (!Number.isFinite(acc2)) die('phaseF: alloc probe produced non-finite acc');
+
+  return { report, bytesPerCall: alloc.bytesPerCall, shadowFaces: stage.stats.shadowFacesDrawn };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -544,12 +611,13 @@ async function main() {
   const c = phaseC();
   const d = phaseD();
   const e = await phaseE();
+  const f = phaseF();
 
   const retentionOk = a.activeCount === 0 && a.nodesCount === 0 &&
     a.trackerSize <= a.residualCeiling && a.findings === 0 &&
     e.residual <= e.RES_E && e.findings === 0;
   const budgetOk = b.report.ok && b.bytesPerCall === 0 && d.report.ok && d.bytesPerCall === 0 &&
-    e.report.ok && e.bytesPerCall === 0;
+    e.report.ok && e.bytesPerCall === 0 && f.report.ok && f.bytesPerCall === 0;
   const controlOk = c.caught;
 
   const g = b.summary.gc;
@@ -557,7 +625,7 @@ async function main() {
     'GATE leak=size ' + a.trackerSize + '/' + a.residualCeiling + ' findings=' + a.findings +
     ' warnings=0 pinned=' + a.pinned + ' pickResidual=' + e.residual + '/' + e.RES_E +
     ' | gc major=' + g.major + ' minor=' + g.minor + ' maxMs=' + g.maxMs.toFixed(2) +
-    ' | alloc=' + b.bytesPerCall + ' B/op pick=' + e.bytesPerCall + ' B/op\n');
+    ' | alloc=' + b.bytesPerCall + ' B/op pick=' + e.bytesPerCall + ' B/op layers=' + f.bytesPerCall + ' B/op shadowFaces=' + f.shadowFaces + '\n');
 
   if (retentionOk && budgetOk && controlOk) {
     process.stdout.write('ok\n');
@@ -582,6 +650,9 @@ async function main() {
     }
     for (const v of d.report.violations) {
       process.stderr.write('  violation phaseD ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
+    }
+    for (const v of f.report.violations) {
+      process.stderr.write('  violation phaseF ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
     }
   }
   if (!controlOk) {

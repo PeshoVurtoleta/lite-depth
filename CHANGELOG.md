@@ -4,6 +4,78 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-09-13
+
+Roadmap D5 "Layers": flag-backed membership tags, a flat ground-shadow pass, and a
+pickable-set query, all built on `@zakkster/lite-arena` 1.9.0 tags + `joinN`.
+
+### Added
+
+- **Membership tags.** Three `arena.registerTag()` sets -- `Pickable`, `ShadowCaster`,
+  `Billboard` -- each mirroring a `FLAGS` bit and kept in lockstep on `addNode`, the
+  new `set*` setters, `remove` (auto: `despawn` clears every component), and `clear`
+  (auto: `arena.clear` drops every component count to 0). The bit stays the hot
+  per-node masked compare in `collect`; the tag turns an O(nodes) secondary scan into
+  an O(members) walk for the cold passes. A fourth per-frame derived tag, `Culled`, is
+  reconciled by `syncCulled` from the frame's screen/depth rejection (a new `cullStamp`
+  Uint32 node lane, stored at the two existing node-cull continue sites).
+- **Flag setters + `addNode` init.** `stage.setPickable(h, on)`, `setCastShadow(h, on)`,
+  `setBillboard(h, on)`, and `addNode(..., { pickable, castShadow, billboard })` set
+  the bit and the mirror tag together.
+- **Flat ground-shadow pass.** With a shadow material set (`stage.setShadowMaterial(matId)`,
+  `-1` disables), every non-culled `ShadowCaster` face is flatten-projected onto the
+  world plane `y=0` along `stage.light` and appended to the SAME draw list as a
+  `DRAW_SHADOW` polygon, ordered strictly under the caster: a layer-L (L>=1) caster's
+  shadow goes to layer L-1 (layer bits dominate); a layer-0 caster's shadow is keyed
+  at the caster's farthest view-space extent (bounding-sphere far point) minus one
+  depth unit -- strictly below every one of that caster's real face keys, with NO
+  real-face key changed. The pass is cold, walks only the
+  caster tag members via `arena.joinN([ShadowCaster],[Culled])` (consumed immediately),
+  and reuses the near-clip vertex scratch. Flatten-matrix onto ONE plane -- no shadow
+  maps, no soft shadows. A light parallel to the ground, or a culled/invisible caster,
+  casts nothing (fail closed).
+- **`stage.pickSet(out) -> count`.** Pickable, non-culled dense node indices into a
+  caller-owned array, via `arena.joinN([Pickable],[Culled])`. Bounds a pick broadphase
+  to the pickable set. Zero allocation (hoisted join inputs, reused arena plan).
+- **`stats.shadowFacesDrawn`.** Shadow faces are counted apart from `facesDrawn`, so a
+  caster is never double-counted (its own faces stay in `facesDrawn`).
+- **`createStage(ctx, { checked })`** (dev only, default false) forwards to lite-arena's
+  checked `Arena`: `idx()` validates liveness/membership and `join`/`joinN` return a
+  staleness-guarded plan that throws on a stale read or a required+excluded set. The
+  unchecked default path is byte-identical, so production `frame()` cost is unchanged.
+  This makes the stale-join-plan guard reachable from lite-depth's public API
+  (`stage.arena` + `stage._tags`).
+- **`test/17-layers.test.js`** (23 tests) covering tag/flag lockstep, `Culled`
+  reconcile, `pickSet`, the shadow pass + `shadowFacesDrawn`, `matOverride` run
+  batching, `setShadowMaterial` fail-closed, and the `cullStamp` lane grow. Torture
+  `test/torture.mjs` gains **Phase F** (D5): a dense caster+pickable stage driven
+  through `frame()` + `pickSet()` at `maxMajor/maxMinor: 0` and 0 B/op.
+
+### Changed
+
+- **`paint` reads a per-draw `matOverride` Uint16 lane** instead of `matL[drawNode[e]]`
+  -- a CONVERTED indirection (one Uint16 read where 1.6.0 read the node material via
+  `drawNode`), not an added one, written by `collect` for every emitted entry. For a
+  normal face `matOverride[e]` equals the node material, so style-run batching and the
+  draw output are byte-identical to 1.6.0; a shadow entry carries the stage shadow
+  material. The material registry is capped at 65536 (Uint16), fail-closed at
+  `stage.material()`.
+- **`maxDrawFaces` sizing.** A shadow-casting node counts TWICE against the budget
+  (its own faces + its shadow faces); size for `visible faces + caster faces`.
+- **FLAGS D-14.** Every `FLAGS` bit is now consumed by code (`VISIBLE`, `DIRTY`,
+  `NON_UNIFORM_SCALE`, `DOUBLE_SIDED`, `STROKE`, `PICKABLE`, `CAST_SHADOW`) or reserved
+  with a dated milestone comment (`BILLBOARD` -- tag maintained, no draw consumer yet).
+
+### Fixed
+
+- **CHANGELOG 1.6.0 clip-limit wording.** The 1.6.0 entry said the clip buffers cap
+  "`maxClipVerts`, default 16 verts/face", conflating two constants. Corrected:
+  `maxClipVerts` is the per-frame clip-scratch budget (default 4096); the per-face
+  vertex cap is the fixed `CLIP_CAP` (16).
+- **llms.txt D4 surface.** The API body never documented the v1.6.0 pick surface;
+  added `pick`/`pickRect`/`pickRay`/`nearest`, `useSpatialIndex`/`dropSpatialIndex`,
+  `attachPointer`/`detachPointer`, and the `clipNear` / `maxClipVerts` options.
+
 ## [1.6.0] - 2026-09-13
 
 Roadmap D4 "Touch": near-plane Sutherland-Hodgman clipping and a DI-bound
@@ -14,8 +86,11 @@ under Unreleased (`demo/` ships in neither `package.json` `files[]` nor the tarb
 
 - **Near-plane Sutherland-Hodgman clip.** A face straddling the near plane (>= 1
   vertex in front, >= 1 behind) is clipped to the plane and drawn, rather than
-  whole-face rejected. Two preallocated ping-pong polygon buffers (cap
-  `maxClipVerts`, default 16 verts/face) allocate lazily on the first straddle. A
+  whole-face rejected. Two preallocated ping-pong polygon buffers allocate lazily
+  on the first straddle. Two distinct limits govern the clip: `maxClipVerts` is the
+  per-FRAME clip-scratch vertex budget (default 4096), and `CLIP_CAP` is the fixed
+  per-FACE vertex cap (16) -- a face with >= 16 vertices straddling near is rejected
+  whole (fail closed). A
   fully-front face keeps a byte-identical hot body; a fully-behind face is culled
   with no clip work and no allocation. The `clipNear` flag (default true) restores
   the prior whole-face reject when set false.

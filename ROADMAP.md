@@ -792,7 +792,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-depth"
 version_target: 1.5.0
-status: planned
+status: SHIPPED (v1.6.0, 2026-09-13)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0

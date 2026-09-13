@@ -39,6 +39,17 @@ const LAYER_SHIFT = DEPTH_BITS;      // layer occupies the high 6 bits (0..63)
 // test -- then splits stroke vs near-clipped inside the cold branch.
 const DRAW_STROKE = 0xFFFFFFFF;      // one whole-polyline entry (v1.4.0)
 const DRAW_CLIP = 0xFFFFFFFE;        // one near-plane-clipped polygon (D4)
+// One flatten-projected ground-shadow polygon (D5). Like DRAW_CLIP it carries its
+// own explicit screen verts in the clipXY/clipRef scratch, so paint discriminates
+// all three cold entry kinds with the SAME single `fi >= DRAW_SHADOW` compare that
+// was `fi >= DRAW_CLIP` in 1.6.0 -- byte-identical cost -- then splits inside the
+// cold branch. Ordered below DRAW_CLIP so the compare still routes every sentinel.
+const DRAW_SHADOW = 0xFFFFFFFD;
+// View-space depth nudge (toward the camera) added to a shadow's ground centroid
+// so a shadow paints ON TOP of a ground plane it is coincident with, within the
+// same painter layer. Tiny + cold (shadow emission only); z is negative, so +bias
+// raises the quantized depth key = painted later = on top.
+const SHADOW_DEPTH_BIAS = 0.01;
 // Near-clip polygon vertex cap. _clipA/_clipB hold CLIP_CAP verts of (x,y,z);
 // Sutherland-Hodgman against ONE plane yields at most inputVerts+1 output verts,
 // so a face is clip-eligible only when its vertex count is < CLIP_CAP (leaving
@@ -56,6 +67,14 @@ const F_DIRTY = 1 << FLAGS.get('DIRTY');
 const F_DOUBLE = 1 << FLAGS.get('DOUBLE_SIDED');
 const F_STROKE = 1 << FLAGS.get('STROKE');
 const F_NONUNIF = 1 << FLAGS.get('NON_UNIFORM_SCALE');
+const F_PICKABLE = 1 << FLAGS.get('PICKABLE');
+const F_CAST_SHADOW = 1 << FLAGS.get('CAST_SHADOW');
+// FLAGS D-14 (D5): every bit above is consumed by code. BILLBOARD (below) has no
+// internal draw consumer yet -- its bit is kept in sync with the Billboard tag so a
+// consumer can walk billboards in O(members), and it is RESERVED for a screen-facing
+// billboard pass. Milestone: revisit at D8 "Sprites" (roadmap); until then the tag
+// is maintained but nothing in this module reads it.
+const F_BILLBOARD = 1 << FLAGS.get('BILLBOARD');
 
 /* ───────────────────────── math kernels (out-param) ─────────────────────── */
 // No Vec3/Mat4 classes. Everything writes into caller buffers; module-level
@@ -331,7 +350,13 @@ export function createStage(ctx, opts) {
   // (fail closed) once this fills. Modest by default -- straddling faces are rare.
   const maxClipVerts = o.maxClipVerts || 4096;
 
-  const arena = new Arena(maxNodes);
+  // Dev-only checked mode (D5). Opt-in { checked: true } forwards to lite-arena's
+  // checked Arena: idx() validates liveness/membership and every join/joinN hands
+  // back a staleness-guarded plan that THROWS on a stale read or a set that is both
+  // required and excluded -- surfacing a consumer that interleaves its own arena
+  // joins with a lite-depth pass. Default false; lite-arena guarantees the unchecked
+  // path is byte-identical, so production frame() cost is unchanged.
+  const arena = new Arena(maxNodes, { checked: !!o.checked });
   // One SoA component holding every per-node lane. Swap-and-pop on despawn
   // keeps these dense arrays contiguous automatically.
   const nodes = arena.registerComponent({
@@ -349,6 +374,22 @@ export function createStage(ctx, opts) {
     bias: Float64Array,       // depth bias (view-space units)
   });
 
+  // D5 membership tags (lite-arena registerTag = zero-payload SparseSet). Each of
+  // the first three MIRRORS a per-node FLAGS bit. The DUPLICATION is deliberate and
+  // load-bearing: the bit stays the HOT masked compare in collect (costs nothing per
+  // node -- it is already read), while the tag turns an O(nodes) secondary scan into
+  // an O(members) walk for the COLD passes (shadow, pickSet). Bit and tag are kept in
+  // lockstep on addNode / the set* flag setters / remove (auto: despawn clears every
+  // component) / clear (auto: arena.clear drops every component count to 0).
+  const Pickable = arena.registerTag();        // mirrors F_PICKABLE
+  const ShadowCaster = arena.registerTag();    // mirrors F_CAST_SHADOW
+  const Billboard = arena.registerTag();       // mirrors F_BILLBOARD (reserved; see FLAGS D-14)
+  // Culled is NOT flag-backed: it is a per-FRAME derived set, reconciled by
+  // syncCulled() from this frame's screen/depth rejection (cullStamp lane), walking
+  // ONLY ShadowCaster + Pickable members (O(members)). It bounds the shadow pass
+  // (joinN([ShadowCaster],[Culled])) and pickSet (joinN([Pickable],[Culled])).
+  const Culled = arena.registerTag();
+
   // cold registries
   const geometries = [];
   const materials = [];
@@ -361,6 +402,14 @@ export function createStage(ctx, opts) {
   const drawNode = new Uint32Array(maxDrawFaces); // dense node index
   const drawFace = new Uint32Array(maxDrawFaces);
   const shadeL = new Uint8Array(maxDrawFaces);    // per-draw-entry baked LUT index (shade computed in collect)
+  // Per-draw-entry material id (D5). collect writes it for every emitted entry;
+  // paint reads materials[matOverride[e]] INSTEAD OF materials[matL[drawNode[e]]] --
+  // a CONVERTED indirection (one Uint16 read, was one Int32 read via drawNode), not
+  // an added one, so paint's style-run batching is unchanged. For a normal face
+  // matOverride[dc] === node material, so an unflagged scene is byte-identical to
+  // 1.6.0; a shadow entry carries the stage shadow material here instead. Uint16 caps
+  // the material registry at 65535 (guarded fail-closed in stage.material()).
+  const matOverride = new Uint16Array(maxDrawFaces);
   // Near-clip lanes. clipXY holds the projected (x,y) of every clipped polygon
   // vertex this frame; clipRef, indexed by draw entry, packs (startVert << 5) |
   // vertCount for a DRAW_CLIP entry so paint reads the polygon without touching
@@ -411,6 +460,16 @@ export function createStage(ctx, opts) {
   // only under the opt-in dirtyRect lane); _sceneBox is their union, _prevBox the
   // previous frame's union for a redraw delta. Grown in lockstep by reserve().
   let nodeBox = new Float32Array(4 * maxNodes);
+  // Per-node cull stamp lane (D5). collect stores the current frame stamp here at
+  // the two node-cull continue sites; a node d was screen/depth-culled THIS frame
+  // iff cullStamp[d] === _frameStamp. syncCulled reads it (O(members)) to reconcile
+  // the Culled tag. Grown by reserve() in lockstep with the other node lanes.
+  let cullStamp = new Uint32Array(maxNodes);
+  let _frameStamp = 0;                             // per-frame stamp (wrapping; 0 reserved as "never")
+  // Stage shadow material id (D5), -1 = no shadow pass (default: byte-identical to
+  // 1.6.0). Set via stage.setShadowMaterial(matId). A caster casts a flat ground
+  // shadow only when this is >= 0 AND the node is tagged ShadowCaster.
+  let _shadowMat = -1;
   const _sceneBox = aabb2.setEmpty(aabb2.create());
   const _prevBox = aabb2.setEmpty(aabb2.create());
   // Optional spatial-index DI (cold binding via useSpatialIndex). lite-bvh's
@@ -458,7 +517,7 @@ export function createStage(ctx, opts) {
     // path, no cost to the fully-front fast path either way.
     clipNear: true,
     _signals: null,
-    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0 },
+    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0, shadowFacesDrawn: 0 },
     _topoDirty: true,
     // read-only views of the current draw ordering (observation handles only).
     // Accessors declared in the literal so they are part of the stage's initial
@@ -478,7 +537,11 @@ export function createStage(ctx, opts) {
     get sceneBox() { return _sceneBox; },
     get prevSceneBox() { return _prevBox; },
   };
-  stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY, box: nodeBox, clipXY: null, clipRef: null };
+  stage._draw = { key: drawKey, node: drawNode, face: drawFace, vertBase, viewZ, screenXY, box: nodeBox, clipXY: null, clipRef: null, matOverride };
+  // D5 tag handles, exposed read-only for tests/consumers that want to walk the
+  // flag-backed membership sets in O(members) (never mutate them directly -- use the
+  // set* flag setters so bit and tag stay in lockstep).
+  stage._tags = { Pickable, ShadowCaster, Billboard, Culled };
   stage.picked = -1;                             // last picked dense node index (pointer plumbing), -1 = none
   stage.onPick = null;                           // optional (id, ev) => void callback
   stage._geometries = geometries;
@@ -488,7 +551,21 @@ export function createStage(ctx, opts) {
 
   /* ── cold node API ── */
   stage.geometry = (g) => { geometries.push(g); return geometries.length - 1; };
-  stage.material = (m) => { materials.push(m); return materials.length - 1; };
+  stage.material = (m) => {
+    // The per-entry matOverride lane is Uint16, so a material id must fit in 0..65535.
+    // Fail closed at registration rather than silently wrap an id on the hot path.
+    if (materials.length >= 65536) throw new Error('lite-depth: material registry full -- the per-draw matOverride lane is Uint16 (max 65536 materials).');
+    materials.push(m); return materials.length - 1;
+  };
+  // Register the flat ground-shadow material (D5). Casters tagged ShadowCaster cast
+  // a shadow only after this is set. -1 (default) => no shadow pass. Fail closed on
+  // an out-of-range id (an unregistered material is not zero).
+  stage.setShadowMaterial = (matId) => {
+    if (matId !== -1 && !(Number.isInteger(matId) && matId >= 0 && matId < materials.length)) {
+      throw new Error('lite-depth: setShadowMaterial(matId) needs a registered material id (0..' + (materials.length - 1) + ') or -1 to disable, got ' + matId);
+    }
+    _shadowMat = matId; return stage;
+  };
 
   stage.addNode = (geomId, matId, init) => {
     const h = arena.spawn();
@@ -506,7 +583,16 @@ export function createStage(ctx, opts) {
       if (init.z !== undefined) D.pz[d] = init.z;
       if (init.layer !== undefined) D.layer[d] = init.layer;
       if (init.parent) D.parent[d] = init.parent;
+      if (init.pickable) D.flags[d] |= F_PICKABLE;
+      if (init.castShadow) D.flags[d] |= F_CAST_SHADOW;
+      if (init.billboard) D.flags[d] |= F_BILLBOARD;
     }
+    // D5: seed the membership tags from the initial flags so bit and tag start in
+    // lockstep (the set* setters keep them so; despawn/clear untag automatically).
+    const f = D.flags[d];
+    if (f & F_PICKABLE) Pickable.add(h);
+    if (f & F_CAST_SHADOW) ShadowCaster.add(h);
+    if (f & F_BILLBOARD) Billboard.add(h);
     stage._topoDirty = true;
     _structureEpoch = (_structureEpoch + 1) >>> 0;
     return h;
@@ -530,6 +616,12 @@ export function createStage(ctx, opts) {
   stage.setLayer = (h, layer) => { nodes.data.layer[nodes.idx(h)] = layer & 63; };
   stage.setDepthBias = (h, bias) => { nodes.data.bias[nodes.idx(h)] = bias; };
   stage.setVisible = (h, v) => { const d = nodes.idx(h), D = nodes.data; if (v) D.flags[d] |= F_VISIBLE; else D.flags[d] &= ~F_VISIBLE; };
+  // D5 flag setters: mutate the per-node bit AND the mirror tag in lockstep (see the
+  // tag decls). on/off is coerced to boolean by the ternary; the tag add/remove is
+  // O(1) and idempotent.
+  stage.setPickable = (h, on) => { const d = nodes.idx(h), D = nodes.data; if (on) { D.flags[d] |= F_PICKABLE; Pickable.add(h); } else { D.flags[d] &= ~F_PICKABLE; Pickable.remove(h); } };
+  stage.setCastShadow = (h, on) => { const d = nodes.idx(h), D = nodes.data; if (on) { D.flags[d] |= F_CAST_SHADOW; ShadowCaster.add(h); } else { D.flags[d] &= ~F_CAST_SHADOW; ShadowCaster.remove(h); } };
+  stage.setBillboard = (h, on) => { const d = nodes.idx(h), D = nodes.data; if (on) { D.flags[d] |= F_BILLBOARD; Billboard.add(h); } else { D.flags[d] &= ~F_BILLBOARD; Billboard.remove(h); } };
   stage.remove = (h) => { arena.despawn(h); stage._topoDirty = true; _structureEpoch = (_structureEpoch + 1) >>> 0; };
   stage.resize = (w, hh, dpr) => { stage.width = w; stage.height = hh; stage.dpr = dpr || stage.dpr; _vx0 = 0; _vy0 = 0; _vx1 = w; _vy1 = hh; };
 
@@ -567,6 +659,7 @@ export function createStage(ctx, opts) {
     const nv = new Int32Array(n); nv.set(vertBase); vertBase = nv; stage._draw.vertBase = nv;
     const nnb = new Float32Array(4 * n); nnb.set(nodeBox); nodeBox = nnb;  // node-box lane: 4 floats/node
     stage._draw.box = nnb;
+    const ncs = new Uint32Array(n); ncs.set(cullStamp); cullStamp = ncs;   // cull-stamp lane (D5)
     // spatial-index lanes grow in lockstep with the node-box lane they mirror --
     // but only once allocated (lazy: a stage with no bound index has them null).
     if (fatNodeBox !== null) {
@@ -762,6 +855,35 @@ export function createStage(ctx, opts) {
     return best;
   };
 
+  // D5 join inputs, hoisted ONCE so joinN gets a stable array and no per-call
+  // literal allocates. lite-depth calls joinN at most once per pass and consumes the
+  // reused plan immediately (lite-arena's shared-scratch contract): a consumer that
+  // calls arena.joinN on THIS arena mid-frame invalidates any lite-depth plan still
+  // being read -- but lite-depth never retains one across a call, so its own passes
+  // are safe. shadowPass and pickSet never overlap (pickSet is cold, post-frame).
+  const _pickReq = [Pickable], _pickExc = [Culled];
+  const _shadowReq = [ShadowCaster], _shadowExc = [Culled];
+
+  // Pickable, not-culled dense node indices into the caller-owned `out`, count
+  // returned. Bounds a broadphase to the pickable set via joinN([Pickable],[Culled]):
+  // the driver is Pickable (the only required set), Culled is the sole exclusion.
+  // Zero allocation (hoisted inputs + reused plan + caller out). Culled reflects the
+  // most recent frame(); call this after frame(). Consumes the joinN plan immediately.
+  stage.pickSet = (out) => {
+    const p = arena.joinN(_pickReq, _pickExc);
+    const drv = p.driver, n = p.count, ex = p.excl, nx = p.exclCount;
+    const cap = out.length; let c = 0;
+    for (let i = 0; i < n; i++) {
+      const h = drv.dense[i];
+      let ok = true;
+      for (let k = 0; k < nx; k++) { if (ex[k].has(h)) { ok = false; break; } }
+      if (!ok) continue;
+      if (c >= cap) break;
+      out[c++] = nodes.idx(h);
+    }
+    return c;
+  };
+
   /* -- cold: pointer plumbing -> pick only -- */
   // pointerdown/move/up route to pick(); orbit/camera interaction is DELIBERATELY
   // not here -- it ships as a separate companion package (roadmap #1), so this
@@ -847,7 +969,7 @@ export function createStage(ctx, opts) {
     const D = nodes.data, count = nodes.count;
     if (stage._topoDirty) rebuildTopo();
     const st = stage.stats;
-    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0;
+    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0; st.shadowFacesDrawn = 0;
     // Observability hooks. Integer stores OUTSIDE both hot loops: nodesTotal is
     // the live node count; facesOverflowed is reset here and fires per NODE in the
     // collect pass (the overflow door); nodesInvalid is reset here and now fires
@@ -933,6 +1055,11 @@ export function createStage(ctx, opts) {
     if (wantBox) {
       for (let d = 0; d < count; d++) { const j = d << 2; nodeBox[j] = Infinity; nodeBox[j + 1] = Infinity; nodeBox[j + 2] = -Infinity; nodeBox[j + 3] = -Infinity; }
     }
+    // D5 per-frame cull stamp. A node whose cullStamp equals this value was
+    // screen/depth-culled THIS frame (set at the two continue sites below). Bumped
+    // once (cold); 0 is reserved as "never culled", so on the 2^32 wrap the lane is
+    // cleared and the stamp restarts at 1 -- no stale 0 can read as culled.
+    const stamp = _frameStamp = ((_frameStamp + 1) >>> 0) || (cullStamp.fill(0), 1);
     let vc = 0, dc = 0;
 
     for (let i = 0; i < count; i++) {
@@ -953,7 +1080,7 @@ export function createStage(ctx, opts) {
             Number.isFinite(cvz) && Number.isFinite(rad) && Number.isFinite(bias))) {
         st.nodesInvalid++; continue;
       }
-      if (cvz - rad > -near || cvz + rad < -far) { st.nodesCulled++; continue; }
+      if (cvz - rad > -near || cvz + rad < -far) { cullStamp[d] = stamp; st.nodesCulled++; continue; }
 
       // overflow door (D-07): two integer compares per NODE, hoisted above both
       // inner loops. If this node's verts or faces would run past the frame-arena
@@ -1001,7 +1128,7 @@ export function createStage(ctx, opts) {
         }
         // one draw entry for the whole polyline at its centre depth
         drawKey[dc] = packKey(layerL[d], quantize(cvz + bias, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; dc++;
+        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; matOverride[dc] = matL[d]; dc++;
         continue;
       }
 
@@ -1016,7 +1143,7 @@ export function createStage(ctx, opts) {
       // and the face loop runs ZERO iterations.
       if (nbMinX <= nbMaxX && nbMinY <= nbMaxY) {           // valid, non-empty, finite
         if (!(nbMinX <= vx1 && nbMaxX >= vx0 && nbMinY <= vy1 && nbMaxY >= vy0)) {
-          st.nodesCulled++; continue;                        // nodeBox stays empty (pre-pass)
+          cullStamp[d] = stamp; st.nodesCulled++; continue;  // nodeBox stays empty (pre-pass)
         }
         if (wantBox) {
           const j = d << 2;
@@ -1116,7 +1243,7 @@ export function createStage(ctx, opts) {
         if (area >= 0 && (flags[d] & F_DOUBLE) === 0) { st.facesCulled++; continue; }
         const cz = czSum / n + bias;
         drawKey[dc] = packKey(layerL[d], quantize(cz, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = fi;
+        drawNode[dc] = d; drawFace[dc] = fi; matOverride[dc] = matL[d];
         // bake the shade into the draw lane. Uniform: one sqrt-free dot with the
         // back-rotated light (which already carries the world transform). Tainted:
         // transform the local normal by the per-node normal matrix, normalize, and
@@ -1140,6 +1267,16 @@ export function createStage(ctx, opts) {
       }
     }
     st.tProject = clock.now() - t;
+
+    // D5 secondary passes (COLD, O(members) -- never O(scene)). Reconcile the Culled
+    // tag from this frame's cull stamps whenever any flag-backed tag has members, so
+    // both the shadow pass and a post-frame pickSet see fresh membership. Then, if a
+    // shadow material is set, flatten-project every non-culled ShadowCaster onto the
+    // ground and append the shadow polygons to the SAME draw list (before the sort).
+    if (ShadowCaster.count !== 0 || Pickable.count !== 0) syncCulled(stamp);
+    if (_shadowMat >= 0 && ShadowCaster.count !== 0) {
+      dc = shadowPass(dc, near, far, zSpan, halfW, halfH, focal, ortho, orthoK, lgx, lgy, lgz);
+    }
 
     // Opt-in scene-bbox merge (dirty-rect lane). Snapshot last frame's union into
     // _prevBox for a redraw delta, then fold THIS frame's node boxes into _sceneBox
@@ -1286,16 +1423,128 @@ export function createStage(ctx, opts) {
     if (ndl < 0) ndl = 0; else if (ndl > 1) ndl = 1;
     // emit one draw entry; clipRef packs (startVert << 5) | vertCount (outN <= 16).
     drawKey[dc] = packKey(layer, quantize(czSum / outN + bias, near, far, zSpan));
-    drawNode[dc] = d; drawFace[dc] = DRAW_CLIP;
+    drawNode[dc] = d; drawFace[dc] = DRAW_CLIP; matOverride[dc] = D.mat[d];
     clipRef[dc] = (w0 << 5) | outN;
     shadeL[dc] = (ndl * matK1) | 0;
     _clipWrite = w0 + outN;
     return dc + 1;
   }
 
+  // Cold: reconcile the Culled tag for THIS frame. Walks ONLY the flag-backed tag
+  // members (O(members), never the scene): a member culled this frame (cullStamp[d]
+  // === stamp) joins Culled, one that survived leaves it. Tags store live handles
+  // (they survive swap-and-pop); map to the dense index with nodes.idx. Zero alloc.
+  function syncCulled(stamp) {
+    const cs = cullStamp;
+    const sc = ShadowCaster.dense, scn = ShadowCaster.count;
+    for (let i = 0; i < scn; i++) { const h = sc[i]; if (cs[nodes.idx(h)] === stamp) Culled.add(h); else Culled.remove(h); }
+    const pk = Pickable.dense, pkn = Pickable.count;
+    for (let i = 0; i < pkn; i++) { const h = pk[i]; if (cs[nodes.idx(h)] === stamp) Culled.add(h); else Culled.remove(h); }
+  }
+
+  // Cold: flat ground-shadow pass (D5). For every non-culled ShadowCaster, flatten
+  // each face onto the world plane y=0 along the light direction, project to screen,
+  // and append ONE draw entry per face to the SAME draw list -- a DRAW_SHADOW polygon
+  // in the clipXY/clipRef scratch (shared with the near-clip path; sequential within
+  // a frame, so no conflict), painted at layer-1 with the stage shadow material. The
+  // joinN([ShadowCaster],[Culled]) plan is arena-owned reused scratch, consumed here
+  // immediately and never retained. Loops to driver.count / exclCount, never .length.
+  // Fail closed: a light parallel to the ground (no vertical component) casts no
+  // shadow; a caster with no faces, invisible, or a face straddling the near plane is
+  // skipped; both overflow doors reject whole (facesOverflowed) rather than overrun.
+  function shadowPass(dc, near, far, zSpan, halfW, halfH, focal, ortho, orthoK, lgx, lgy, lgz) {
+    if (!(lgy > 1e-6 || lgy < -1e-6)) return dc;       // light parallel to y=0 -> shadow at infinity
+    const invLy = 1 / lgy;
+    const p = arena.joinN(_shadowReq, _shadowExc);
+    const drv = p.driver, n = p.count, ex = p.excl, nx = p.exclCount;
+    const D = nodes.data, flags = D.flags, geomL = D.geom, layerL = D.layer, biasL = D.bias, st = stage.stats;
+    const V = stage.camera.view;
+    const smat = _shadowMat;
+    ensureClip();
+    const cw = clipXY, cr = clipRef, capVerts = cw.length >> 1;
+    for (let i = 0; i < n; i++) {
+      const h = drv.dense[i];
+      let excluded = false;
+      for (let k = 0; k < nx; k++) { if (ex[k].has(h)) { excluded = true; break; } }
+      if (excluded) continue;
+      const d = nodes.idx(h);
+      if ((flags[d] & F_VISIBLE) === 0 || (flags[d] & F_STROKE) !== 0) continue;
+      const g = geometries[geomL[d]], F = g.F;
+      if (F === 0) continue;
+      const M0 = D.m0[d], M1 = D.m1[d], M2 = D.m2[d], M3 = D.m3[d], M4 = D.m4[d], M5 = D.m5[d];
+      const M6 = D.m6[d], M7 = D.m7[d], M8 = D.m8[d], M9 = D.m9[d], M10 = D.m10[d], M11 = D.m11[d];
+      const off = g.faceVertOffset, fv = g.faceVerts, gv = g.verts;
+      const layer = layerL[d], slayer = layer > 0 ? layer - 1 : 0, bias = biasL[d];
+      // Layer-0 ordering (D5 fix). For a caster at layer L >= 1 the shadow goes to
+      // layer L-1, so its key's layer bits are strictly below the caster's and it
+      // paints under regardless of depth. At layer 0 there is NO layer below, so the
+      // shadow shares the caster's layer band and ordering falls to the depth field
+      // alone -- and a ground shadow's own centroid can sort AHEAD of the caster's far
+      // faces from many angles (the SHADOW_DEPTH_BIAS only defends against a coincident
+      // ground MESH, not the caster's own faces). Fix WITHOUT touching real-face keys:
+      // key every layer-0 shadow at the caster's FARTHEST view-space extent (bounding-
+      // sphere far point) minus one depth unit. A face centroid is never farther than
+      // the bounding sphere (centroid is within radius of the center in each axis), and
+      // quantize is monotonic in z, so this key is strictly below EVERY one of that
+      // caster's real face keys. Semantics: a layer-0 caster's shadow sorts at (and just
+      // below) the caster's far depth within layer 0. Residual: if the caster's far
+      // extent is at/beyond the far plane it quantizes to the depth floor (0), where
+      // strict-under is not representable and the key clamps to 0 (a bounded tie,
+      // shadow <= real, never over). Cold path (once per caster), no real-face key changed.
+      let layer0Depth = 0;
+      if (layer === 0) {
+        const cvz = V[8] * M3 + V[9] * M7 + V[10] * M11 + V[11];
+        // Magnitude-aware max: a mirror/negative-axis scale has half-extent |scale|,
+        // so the SIGNED max would underestimate rad (a dominant negative axis is never
+        // picked) and let the shadow key climb over the caster's faces. abs fixes it.
+        const rad = g.radius * Math.max(Math.abs(D.sx[d]), Math.abs(D.sy[d]), Math.abs(D.sz[d]));
+        const q = quantize(cvz - rad + bias, near, far, zSpan);
+        layer0Depth = q > 0 ? q - 1 : 0;
+      }
+      for (let fi = 0; fi < F; fi++) {
+        const o0 = off[fi], o1 = off[fi + 1], vn = o1 - o0;
+        if (vn < 3 || vn > 31) continue;                 // clipRef packs count in 5 bits (0..31)
+        if (dc >= maxDrawFaces) { st.facesOverflowed++; return dc; }        // draw-list overflow
+        const w0 = _clipWrite;
+        if (w0 + vn > capVerts) { st.facesOverflowed++; return dc; }        // shadow/clip vert overflow
+        let czSum = 0, minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity, bad = false;
+        for (let j = o0, kk = 0; j < o1; j++, kk++) {
+          const vi = fv[j] * 3, lx = gv[vi], ly = gv[vi + 1], lz = gv[vi + 2];
+          const wx = M0 * lx + M1 * ly + M2 * lz + M3;
+          const wy = M4 * lx + M5 * ly + M6 * lz + M7;
+          const wz = M8 * lx + M9 * ly + M10 * lz + M11;
+          // flatten onto y=0 along the light: P = W - (Wy/Ly) * light
+          const s = wy * invLy, gxw = wx - s * lgx, gzw = wz - s * lgz;
+          const vx = V[0] * gxw + V[1] * 0 + V[2] * gzw + V[3];
+          const vy = V[4] * gxw + V[5] * 0 + V[6] * gzw + V[7];
+          const vz = V[8] * gxw + V[9] * 0 + V[10] * gzw + V[11];
+          if (!(vz <= -near)) { bad = true; break; }      // behind near (or NaN) -> skip face, fail closed
+          czSum += vz;
+          let sX, sY;
+          if (ortho) { sX = halfW + vx * orthoK; sY = halfH - vy * orthoK; }
+          else { const inv = focal / (-vz); sX = halfW + vx * inv; sY = halfH - vy * inv; }
+          cw[(w0 + kk) * 2] = sX; cw[(w0 + kk) * 2 + 1] = sY;
+          if (sX < minx) minx = sX; if (sX > maxx) maxx = sX; if (sY < miny) miny = sY; if (sY > maxy) maxy = sY;
+        }
+        if (bad) continue;                                // _clipWrite not advanced -> slots reused
+        if (!(minx <= _vx1 && maxx >= _vx0 && miny <= _vy1 && maxy >= _vy0)) continue;  // viewport cull
+        // Layer >= 1: ground-centroid depth (layer bits already dominate, so inter-
+        // shadow depth sorting is free). Layer 0: the caster-far-extent depth computed
+        // above, guaranteeing the shadow paints strictly under its own caster.
+        const sdepth = layer === 0 ? layer0Depth : quantize(czSum / vn + bias + SHADOW_DEPTH_BIAS, near, far, zSpan);
+        drawKey[dc] = packKey(slayer, sdepth);
+        drawNode[dc] = d; drawFace[dc] = DRAW_SHADOW; cr[dc] = (w0 << 5) | vn;
+        matOverride[dc] = smat; shadeL[dc] = 0;           // darkest ramp step (flat shadow)
+        _clipWrite = w0 + vn;
+        dc++;
+      }
+    }
+    return dc;
+  }
+
   function paint(order, dc) {
     const c = ctx, D = nodes.data;
-    const geomL = D.geom, matL = D.mat;
+    const geomL = D.geom;
     const st = stage.stats;
     // reset transform + clear
     if (stage.view2d) { const t2 = stage.view2d; c.setTransform(t2[0], t2[1], t2[2], t2[3], t2[4], t2[5]); }
@@ -1313,12 +1562,15 @@ export function createStage(ctx, opts) {
 
     for (let i = 0; i < dc; i++) {
       const e = order[i], d = drawNode[e], fi = drawFace[e];
-      const g = geometries[geomL[d]], mat = materials[matL[d]];
+      // D5: the per-entry material comes from matOverride (a CONVERTED indirection --
+      // one Uint16 read where 1.6.0 read matL[d]); for a normal face it equals the
+      // node material (byte-identical), for a shadow it is the stage shadow material.
+      const g = geometries[geomL[d]], mat = materials[matOverride[e]];
       const base = vertBase[d];
 
-      // Sentinel split: one `fi >= DRAW_CLIP` compare (same cost as the v1.5.1
-      // `=== 0xFFFFFFFF`) routes both cold entry kinds out of the fill path.
-      if (fi >= DRAW_CLIP) {
+      // Sentinel split: one `fi >= DRAW_SHADOW` compare (same cost as the 1.6.0
+      // `fi >= DRAW_CLIP`) routes all three cold entry kinds out of the fill path.
+      if (fi >= DRAW_SHADOW) {
         if (fi === DRAW_STROKE) {  // stroke polyline
           if (open) { if (curFill) { c.fill(); st.drawCalls++; } if (curStroke) { c.strokeStyle = curStroke; c.lineWidth = curLineWidth; c.stroke(); st.drawCalls++; } open = false; curStyle = null; }
           c.strokeStyle = mat.stroke || mat.lut[mat.K - 1];
@@ -1328,8 +1580,11 @@ export function createStage(ctx, opts) {
           c.stroke(); st.drawCalls++; st.facesDrawn++;
           continue;
         }
-        // DRAW_CLIP: a near-plane-clipped polygon. clipRef packs the clipXY start
-        // vertex (>> 5) and vertex count (& 31). Style-run-batched like a fill.
+        // DRAW_CLIP (near-clipped face) or DRAW_SHADOW (flat ground shadow): both are
+        // explicit-vertex polygons in clipXY; clipRef packs the start vertex (>> 5)
+        // and vertex count (& 31). Style-run-batched like a fill. Counted separately:
+        // a shadow bumps shadowFacesDrawn so a caster is never double-counted in
+        // facesDrawn (its own faces already counted below).
         const ref = clipRef[e], cvN = ref & 31, cw0 = ref >>> 5;
         const cstyle = mat.lut[shadeL[e]], cfill = mat.fill, cstroke = mat.stroke;
         if (cstyle !== curStyle || cfill !== curFill || cstroke !== curStroke) {
@@ -1338,7 +1593,7 @@ export function createStage(ctx, opts) {
         }
         for (let k = 0; k < cvN; k++) { const X = clipXY[(cw0 + k) * 2], Y = clipXY[(cw0 + k) * 2 + 1]; if (k === 0) c.moveTo(X, Y); else c.lineTo(X, Y); }
         c.closePath();
-        st.facesDrawn++;
+        if (fi === DRAW_SHADOW) st.shadowFacesDrawn++; else st.facesDrawn++;
         continue;
       }
 
@@ -1363,4 +1618,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.6.0';
+export const version = '1.7.0';
