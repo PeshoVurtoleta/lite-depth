@@ -129,6 +129,11 @@ export interface StageStats {
   nodesOrphaned: number;
   /** Live node count this frame. */
   nodesTotal: number;
+  /** D6 "Offthread": monotonic RUN counter of frames SKIPPED because a Worker had
+   *  not yet returned the transferred world-matrix buffers (fail-closed stall; the
+   *  canvas keeps its last painted frame). Incremented on a stall, NEVER reset
+   *  inside frame(). Always 0 when no Worker is bound. */
+  offthreadStalls: number;
 }
 
 /** Opaque generational node handle (lite-arena). Stale handles invalidate, never alias. */
@@ -225,8 +230,28 @@ export interface Stage {
   /** Drive a node channel from a signal getter (cold path; writes lanes + marks dirty). */
   bind(h: NodeHandle, channel: BindChannel, get: () => ArrayLike<number>): void;
 
+  /**
+   * D6 "Offthread": opt-in, DI. Bind a Worker (node:worker_threads or a browser
+   * Worker) that runs the transform pass off the main thread via lite-arena's
+   * detach/rebind transferable round-trip -- the Worker must speak the DepthWorker.js
+   * protocol. Cold path; returns the stage. Pass null to unbind (the transform pass
+   * reverts to the byte-identical on-thread frame body). While bound, frame() sends
+   * the current poses + topo to the Worker and projects the matrices the Worker
+   * returned for the PREVIOUS send; a frame whose buffers are not yet home is SKIPPED
+   * (see stats.offthreadStalls).
+   */
+  useWorker(worker: DepthTransformWorker | null): Stage;
+
   /** Run one frame: transform → project → cull → radix sort → paint. Zero allocation. */
   frame(dt: number): StageStats;
+}
+
+/** Minimal Worker shape stage.useWorker() accepts: postMessage + a message listener
+ *  in either the node:worker_threads (.on) or browser (.addEventListener) shape. */
+export interface DepthTransformWorker {
+  postMessage(message: unknown, transfer?: unknown[]): void;
+  on?(event: 'message', listener: (msg: unknown) => void): unknown;
+  addEventListener?(event: 'message', listener: (ev: { data: unknown }) => void): void;
 }
 
 export const mathKernels: {

@@ -89,7 +89,7 @@
  */
 
 import { createStage, geometry, material } from '../Depth.js';
-import { checkNoGc, measureOps, measureAllocs } from '@zakkster/lite-gc-profiler';
+import { checkNoGc, measureOps, measureAllocs, GcProfiler } from '@zakkster/lite-gc-profiler';
 import { createLeakTracker } from '@zakkster/lite-leak';
 // lite-bvh is DI-bound (devDependency, never a runtime dep of Depth.js). Phase E
 // drives the real pick index through the stage's useSpatialIndex() binding.
@@ -599,6 +599,201 @@ function phaseF() {
   return { report, bytesPerCall: alloc.bytesPerCall, shadowFaces: stage.stats.shadowFacesDrawn };
 }
 
+// --- Phase G: off-thread transform (D6 "Offthread") --------------------------
+//
+// The transform pass moves off the main thread via stage.useWorker() +
+// lite-arena's detach/rebind transferable round-trip. This phase gates the
+// properties D6 exists to guarantee:
+//
+//   1. SHADING PARITY. The on-thread and off-thread backends must paint
+//      BYTE-IDENTICALLY -- same draw order, same per-face shade -- INCLUDING a
+//      non-uniformly-scaled node AND a child of a non-uniform parent (the
+//      inverse-transpose shade branch, selected by the WORLD non-uniform bit the
+//      Worker now propagates + transfers back), AND a dirty-then-frame case. Proven
+//      by recording the exact ctx.fillStyle/strokeStyle sequence from a real paint
+//      on each backend and asserting the sequences are equal.
+//
+//   2. MAIN-THREAD FRAME BODY ZERO-ALLOC. A loopback stub keeps the lanes home and,
+//      after priming, stops rebinding -- so measureAllocs sees the off-thread frame
+//      BODY only (project + collect + sort + paint + the send leg), EXCLUDING the
+//      return-leg rebind. That body must be 0 B/op: the send structures are all
+//      pre-allocated and refilled in place. (The rebind IS young-gen -- see finding
+//      5 -- and is covered by the maxMajor-0 real-Worker window below, not here.)
+//
+//   3. REAL ROUND-TRIP over HOT_FRAMES with a node:worker_threads Worker bound.
+//      Each frame is one awaited detach->transfer->compose->transfer->rebind cycle.
+//      Gates: maxMajor 0 / maxPauseMs<=4 across 20000 frames (the async driver's
+//      Promises + the return-leg rebind views are young-gen minor garbage, so
+//      maxMinor is NOT gated here); EXACTLY ONE per-frame postMessage per direction
+//      (topo/parentDense are structural -- copied once, re-synced on epoch change --
+//      not out-and-back per frame); the bootstrap stall (frame 1 is a send-only
+//      stall until real matrices are home); and the fail-closed in-flight stall.
+
+// A Canvas2D-shaped recorder: every paint call is a no-op, but fill()/stroke()
+// append the CURRENT style so two backends' paint output can be compared exactly.
+function recordCtx() {
+  const fills = [];
+  return {
+    fills, fillStyle: '', strokeStyle: '', lineWidth: 1,
+    setTransform() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {}, closePath() {},
+    fill() { fills.push('f:' + this.fillStyle); },
+    stroke() { fills.push('s:' + this.strokeStyle + '@' + this.lineWidth); },
+  };
+}
+
+// A small scene that FORCES both shade branches: a non-uniformly-scaled parent, a
+// uniform-local child UNDER it (its composed world basis is non-uniform too), and a
+// uniform-scaled root. Deterministic so the two backends must match exactly.
+function buildParityStage(ctx) {
+  const s = createStage(ctx, { maxNodes: 16, width: 800, height: 600, camera: { theta: 0.6, phi: 1.0, radius: 14 } });
+  const g = s.geometry(geometry.box(1, 1, 1)), m = s.material(material({ r: 180, g: 120, b: 90, ambient: 0.3 }));
+  const a = s.addNode(g, m, { x: -2, y: 0, z: 0 }); s.setScale(a, 2, 0.5, 1);          // non-uniform parent
+  s.addNode(g, m, { x: 1, y: 0, z: 0.5, parent: a });                                   // child of non-uniform parent
+  const c = s.addNode(g, m, { x: 2, y: 1, z: 0 }); s.setScale(c, 1.4, 1.4, 1.4);        // uniform root
+  s.setEuler(a, 0.3, 0.4, 0.1);
+  return { stage: s, a };
+}
+
+// 1. Shading parity. Scoped in its own function so its stages (+ the parity Worker)
+// are unreachable and collectable BEFORE phase 3's pre-window gc() -- a retained
+// DENSE/parity stage would inflate baseline old-gen and tip the maxMajor-0 window.
+async function phaseG_parity(Worker) {
+  const rctx = recordCtx();
+  const ref = buildParityStage(rctx);
+  const wctx = recordCtx();
+  const wk = buildParityStage(wctx);
+  const pworker = new Worker(new URL('../DepthWorker.js', import.meta.url));
+  let ppending = null;
+  wk.stage.useWorker(pworker);
+  pworker.on('message', () => { const r = ppending; ppending = null; if (r) r(); });
+  const rtP = () => new Promise((res) => { ppending = res; wk.stage.frame(DT); });
+
+  // Off-thread paints world(P) where P is the pose at entry: one round-trip sends P
+  // and homes world(P); a second round-trip (with the record cleared first) paints it.
+  async function workerFills() { await rtP(); wctx.fills.length = 0; await rtP(); return wctx.fills.slice(); }
+  await rtP();   // frame 1: bootstrap send-only stall -> reply primes composed matrices
+  if (wk.stage.stats.offthreadStalls !== 1) die('phaseG: bootstrap did not stall exactly once (got ' + wk.stage.stats.offthreadStalls + ')');
+
+  ref.stage.frame(DT);
+  const refStatic = rctx.fills.slice();
+  const wkStatic = await workerFills();
+  if (refStatic.length === 0) die('phaseG: parity ref painted nothing');
+  if (ref.stage.stats.nodesNonUniform !== wk.stage.stats.nodesNonUniform || ref.stage.stats.nodesNonUniform < 1) {
+    die('phaseG: non-uniform node count mismatch/absent (ref=' + ref.stage.stats.nodesNonUniform + ' wk=' + wk.stage.stats.nodesNonUniform + ')');
+  }
+  if (refStatic.length !== wkStatic.length || refStatic.join('|') !== wkStatic.join('|')) {
+    die('phaseG: SHADING PARITY (static) mismatch -- on-thread and off-thread paint differently (ref ' + refStatic.length + ' vs wk ' + wkStatic.length + ' draws)');
+  }
+
+  // dirty-then-frame: mutate identically on both, buffers are home (rtP awaited), so
+  // the pose write lands on a live lane; then re-compare a fresh paint.
+  ref.stage.setEuler(ref.a, 0.9, 0.2, 0.7); ref.stage.setScale(ref.a, 0.5, 2.5, 1.3);
+  wk.stage.setEuler(wk.a, 0.9, 0.2, 0.7); wk.stage.setScale(wk.a, 0.5, 2.5, 1.3);
+  rctx.fills.length = 0; ref.stage.frame(DT);
+  const refDirty = rctx.fills.slice();
+  const wkDirty = await workerFills();
+  if (refDirty.length !== wkDirty.length || refDirty.join('|') !== wkDirty.join('|')) {
+    die('phaseG: SHADING PARITY (dirty-then-frame) mismatch -- ref ' + refDirty.length + ' vs wk ' + wkDirty.length + ' draws');
+  }
+  await pworker.terminate();
+  return refStatic.length;
+}
+
+// 2. Main-thread frame BODY zero-alloc (loopback stub, rebind excluded). Scoped for
+// the same collectability reason as phase 1.
+function phaseG_bodyAlloc() {
+  const loop = buildDenseStage(DENSE);
+  let lpHandler = null, lpLoopback = true;
+  const loopStub = {
+    on(ev, fn) { if (ev === 'message') lpHandler = fn; },
+    // Loopback: no real transfer, so lanes stay home. While lpLoopback, synchronously
+    // deliver the reply (primes + rebinds); once off, a no-op -- lanes still home (never
+    // transferred), so frame() runs the full BODY with NO rebind allocation.
+    postMessage(msg) { if (lpLoopback && msg && msg.kind === 'f') lpHandler(msg); },
+  };
+  loop.useWorker(loopStub);
+  loop.frame(DT);   // frame 1: topo sync + bootstrap send -> loopback primes + rebinds
+  loop.frame(DT);   // frame 2: project + paint + send (primed, home)
+  if (loop.stats.offthreadStalls !== 1) die('phaseG: loopback bootstrap stall count != 1 (got ' + loop.stats.offthreadStalls + ')');
+  lpLoopback = false;   // stop rebinding -> exclude the return-leg allocation from the probe
+  let accL = 0;
+  const bodyAlloc = measureAllocs(function () {
+    const s = loop.frame(DT);
+    accL = accL + s.facesDrawn + s.nodesTotal;
+  }, { iterations: 4096, warmup: 16 });
+  if (!Number.isFinite(accL) || accL <= 0) die('phaseG: loopback body produced no work (acc=' + accL + ')');
+  if (loop.stats.offthreadStalls !== 1) die('phaseG: loopback body stalled during measurement (lanes should stay home)');
+  return bodyAlloc.bytesPerCall;
+}
+
+async function phaseG() {
+  const { Worker } = await import('node:worker_threads');
+
+  const parityDraws = await phaseG_parity(Worker);
+  const bodyBytesPerCall = phaseG_bodyAlloc();
+
+  // --- 3. real Worker round-trip: gc budget + per-frame message-count invariant --
+  const stage = buildDenseStage(DENSE);
+  const worker = new Worker(new URL('../DepthWorker.js', import.meta.url));
+  let sends = 0, returns = 0;
+  const origPost = worker.postMessage.bind(worker);
+  worker.postMessage = (m, t) => { sends++; return origPost(m, t); };   // count main->worker (incl. topo sync)
+  stage.useWorker(worker);                          // registers the library rebind listener FIRST
+  let pending = null;
+  worker.on('message', () => { returns++; const r = pending; pending = null; if (r) r(); }); // fires AFTER rebind
+  const roundTrip = () => new Promise((res) => { pending = res; stage.frame(DT); });
+
+  for (let i = 0; i < 4; i++) await roundTrip();    // warm: frame 1 bootstrap stall + topo sync, then primed
+  if (stage._drawCount <= 0) die('phaseG: worker-backed stage produced an empty draw list');
+  // Exactly one bootstrap stall (Blocker 2), and by now primed with topo synced.
+  if (stage.stats.offthreadStalls !== 1) die('phaseG: warm stalls != 1 (got ' + stage.stats.offthreadStalls + ')');
+
+  // Direct GcProfiler window (measureOpsAsync cannot deep-settle, and its end-of-
+  // window settle gc() would itself count as major). Clean baseline BEFORE start(),
+  // NO forced gc inside -> the major count is only SPONTANEOUS collections.
+  globalThis.gc(); globalThis.gc();
+  const sendsBefore = sends, returnsBefore = returns, stallsBefore = stage.stats.offthreadStalls;
+  let accW = 0, frameCount = 0;
+  const gc = new GcProfiler().start();
+  for (let i = 0; i < HOT_FRAMES; i++) {
+    await roundTrip();
+    frameCount++;
+    accW = accW + stage.stats.facesDrawn;
+    if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+  }
+  await new Promise((r) => setTimeout(r, 50));   // let async GC entries land before summary
+  const summary = gc.summary();
+  gc.stop();
+  if (!Number.isFinite(accW) || accW <= 0) die('phaseG: worker frame loop produced no work (acc=' + accW + ')');
+
+  // EXACTLY one per-frame postMessage per direction: structure is stable in-window
+  // (topo already synced during warm), so no 't' messages here -- only 'f' round-trips.
+  const sentInWindow = sends - sendsBefore, retInWindow = returns - returnsBefore;
+  if (sentInWindow !== frameCount) die('phaseG: sends ' + sentInWindow + ' != frames ' + frameCount + ' -- not exactly one postMessage per frame');
+  if (retInWindow !== frameCount) die('phaseG: returns ' + retInWindow + ' != frames ' + frameCount + ' -- not exactly one reply per frame');
+  if (stage.stats.offthreadStalls !== stallsBefore) die('phaseG: awaited round-trip stalled in-window (delta=' + (stage.stats.offthreadStalls - stallsBefore) + ')');
+
+  const WK_RULES = { maxMajor: 0, maxPauseMs: 4 };
+  const report = checkNoGc(summary, WK_RULES);
+
+  // Fail-closed in-flight stall proof: two synchronous frames, no await between --
+  // the first sends (lanes were home), the second finds m0 detached and SKIPS the
+  // whole frame, bumping the counter exactly once (never reads a detached lane).
+  const before = stage.stats.offthreadStalls;
+  stage.frame(DT);   // lanes home -> project + send (detaches)
+  stage.frame(DT);   // lanes out  -> stall
+  const stalled = stage.stats.offthreadStalls - before;
+  await worker.terminate();
+  if (stalled !== 1) die('phaseG: fail-closed in-flight stall did not fire exactly once (got ' + stalled + ')');
+
+  return {
+    report, summary,
+    bodyBytesPerCall,
+    frames: frameCount, sends: sentInWindow, returns: retInWindow,
+    parityDraws,
+  };
+}
+
 // --- gate --------------------------------------------------------------------
 
 async function main() {
@@ -606,6 +801,13 @@ async function main() {
     die('run with --expose-gc:  node --expose-gc test/torture.mjs');
   }
 
+  // Phase G runs FIRST: its maxMajor-0 real-Worker window is sensitive to baseline
+  // old-gen size, and the retention phases (A/E leak trackers) + phase C's deliberate
+  // hot-path leak (cSink) leave a large retained heap that would raise the major-GC
+  // threshold crossing during G's 20000-frame window. A pristine baseline keeps the
+  // window's spontaneous major count at 0 without widening any budget. G leaves its
+  // own stages collectable, so the later phases start clean too.
+  const gp = await phaseG();
   const a = await phaseA();
   const b = phaseB();
   const c = phaseC();
@@ -617,15 +819,19 @@ async function main() {
     a.trackerSize <= a.residualCeiling && a.findings === 0 &&
     e.residual <= e.RES_E && e.findings === 0;
   const budgetOk = b.report.ok && b.bytesPerCall === 0 && d.report.ok && d.bytesPerCall === 0 &&
-    e.report.ok && e.bytesPerCall === 0 && f.report.ok && f.bytesPerCall === 0;
+    e.report.ok && e.bytesPerCall === 0 && f.report.ok && f.bytesPerCall === 0 &&
+    gp.report.ok && gp.bodyBytesPerCall === 0;
   const controlOk = c.caught;
 
   const g = b.summary.gc;
+  const wg = gp.summary.gc;
   process.stderr.write(
     'GATE leak=size ' + a.trackerSize + '/' + a.residualCeiling + ' findings=' + a.findings +
     ' warnings=0 pinned=' + a.pinned + ' pickResidual=' + e.residual + '/' + e.RES_E +
     ' | gc major=' + g.major + ' minor=' + g.minor + ' maxMs=' + g.maxMs.toFixed(2) +
-    ' | alloc=' + b.bytesPerCall + ' B/op pick=' + e.bytesPerCall + ' B/op layers=' + f.bytesPerCall + ' B/op shadowFaces=' + f.shadowFaces + '\n');
+    ' | alloc=' + b.bytesPerCall + ' B/op pick=' + e.bytesPerCall + ' B/op layers=' + f.bytesPerCall + ' B/op shadowFaces=' + f.shadowFaces +
+    ' | worker body=' + gp.bodyBytesPerCall + ' B/op parity=' + gp.parityDraws + ' frames=' + gp.frames + ' sends=' + gp.sends + '/' + gp.returns +
+    ' major=' + wg.major + ' maxMs=' + wg.maxMs.toFixed(2) + '\n');
 
   if (retentionOk && budgetOk && controlOk) {
     process.stdout.write('ok\n');
@@ -653,6 +859,10 @@ async function main() {
     }
     for (const v of f.report.violations) {
       process.stderr.write('  violation phaseF ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
+    }
+    process.stderr.write('  phaseG worker bodyBytesPerCall=' + gp.bodyBytesPerCall + ' report.ok=' + gp.report.ok + '\n');
+    for (const v of gp.report.violations) {
+      process.stderr.write('  violation phaseG ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual + '\n');
     }
   }
   if (!controlOk) {

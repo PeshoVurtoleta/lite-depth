@@ -4,6 +4,54 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-09-13
+
+Roadmap D6 "Offthread": an opt-in, DI path that moves the transform pass off the main
+thread via `@zakkster/lite-arena` 1.9.0's detach/rebind transferable round-trip.
+
+### Added
+
+- **`stage.useWorker(worker)`** -- cold-path DI mirroring `useSignals`. Binds a Worker
+  (node:worker_threads or a browser Worker) that composes the world matrices off the
+  main thread; `useWorker(null)` unbinds. Default absent. When no Worker is bound the
+  frame body is byte-identical to the on-thread v1.6.0 path: one boolean gate at the
+  top of `frame()` dispatches to a separate, never-inlined `_offthreadFrame`, so V8
+  never inlines the off-thread machinery into the hot loop.
+- **`DepthWorker.js`** -- the worker module (added to `files[]`). It IMPORTS
+  `mathKernels` (composeTRS/mulAffine) and `FLAGS` from `Depth.js` and reuses them --
+  it does not reimplement the transform math or hardcode the flag bit. It composes
+  TRS -> local -> world in topo order over the transferred lanes AND propagates the
+  WORLD non-uniform bit (`worldNonUnif`) in that same order, then transfers everything
+  back. Runs in both node:worker_threads and a browser module Worker.
+- **`stats.offthreadStalls`** -- a monotonic RUN counter of frames skipped because the
+  Worker had not yet returned the transform buffers (fail-closed stall; the canvas
+  keeps its last paint). Incremented on a stall, never reset inside `frame()`; 0 when
+  no Worker is bound.
+
+### Off-thread model
+
+- **One-frame-latency pipeline.** Each frame projects the matrices the Worker composed
+  from the previous send, then transfers the current lanes out for the next compose.
+  The transfer is the fence -- exactly one thread owns a buffer at a time; plain
+  `ArrayBuffer` only (no `SharedArrayBuffer`, no atomics).
+- **Transfer set.** Per frame (one `postMessage` each direction): the 10 pose lanes
+  `px..sz`, `flags`, and the 12 world-matrix lanes `m0..m11` (23 arena fields), plus
+  the stage-owned `worldNonUnif` buffer. `flags` is transferred so the Worker can
+  propagate `worldNonUnif` for f64-exact shade parity across both backends (including
+  a non-uniform node and a child of a non-uniform parent). `topo`/`parentDense` are
+  structural: the main thread keeps its home copies and sends the Worker copies once
+  on bind, re-syncing only when `structureEpoch` changes -- not out-and-back per frame.
+- **Fail-closed.** `frame()` never reads a detached lane: a bootstrap frame (before the
+  first reply) sends but skips the project (`offthreadStalls++`) rather than paint zero
+  matrices; a frame while the lanes are out is skipped whole; `useWorker(null)` while a
+  send is in flight defers until the reply rebinds; a corrupt reply is a loud crash
+  (`nodes.rebind` validates every buffer before repointing any); a pose setter
+  (`setPosition`/`setScale`/`setQuaternion`/`setEuler`) called while the lanes are
+  detached THROWS rather than silently dropping the write.
+- **Allocation.** The main-thread frame BODY (project/collect/sort/paint + send leg) is
+  0 B/op. The return-leg rebind re-views the transferred-back buffers -- young-gen only,
+  gated at 0 major GC over 20000 frames (not a 0-byte op).
+
 ## [1.7.0] - 2026-09-13
 
 Roadmap D5 "Layers": flag-backed membership tags, a flat ground-shadow pass, and a

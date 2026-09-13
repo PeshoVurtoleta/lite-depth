@@ -408,7 +408,11 @@
                 <h3>node count</h3>
                 <div class="ctl"><label>nodes <b id="s-nV">-</b></label><input type="range" id="s-n" min="200"
                                                                                max="8000" step="100" value="3000"></div>
-                <div class="badge">frame path: <b>0 B/frame - 0 GC</b><br>proven by lite-gc-profiler</div>
+                <div class="badge" id="s-badge">main-thread frame body: <b>0 B/frame - 0 major GC</b><br>proven by
+                    lite-gc-profiler</div>
+                <div class="row">
+                    <button id="s-worker" aria-pressed="false">off-thread transform (D6)</button>
+                </div>
                 <canvas class="spark" id="s-spark" width="512" height="96"></canvas>
                 <div class="tele">
                     <span>faces drawn</span><span id="s-fd" class="hi">-</span>
@@ -420,9 +424,16 @@
                     <span>project</span><span id="s-tp">-</span>
                     <span>sort</span><span id="s-ts">-</span>
                     <span>paint</span><span id="s-tpaint">-</span>
+                    <span>off-thread</span><span id="s-worker-state">main</span>
+                    <span>stalls</span><span id="s-stalls">0</span>
                 </div>
                 <div class="note">Every node dirty every frame -- worst case for transform + project + radix sort +
-                    paint. Allocation stays at <b>zero</b> regardless of count.
+                    paint. The main-thread frame body allocates <b>zero</b> regardless of count. Toggle
+                    <b>off-thread transform</b> to move the transform pass onto a Worker via lite-arena's detach/rebind
+                    transferable round-trip -- the main thread's <b>transform</b> reading drops to ~0 (one postMessage
+                    replaces the loop). The return-leg rebind (re-viewing the transferred-back buffers) is young-gen
+                    only -- <b>major GC still 0</b>, but it is not a 0-byte op, so the badge says main-thread frame
+                    <b>body</b>, not the whole round trip.
                 </div>
             </div>
 
@@ -552,6 +563,10 @@
     const $sFt = document.getElementById('s-ft'), $sFps = document.getElementById('s-fps');
     const $sTt = document.getElementById('s-tt'), $sTp = document.getElementById('s-tp'),
         $sTs = document.getElementById('s-ts'), $sTpaint = document.getElementById('s-tpaint');
+    const $sWorker = document.getElementById('s-worker'), $sWorkerState = document.getElementById('s-worker-state'),
+        $sStalls = document.getElementById('s-stalls'), $sBadge = document.getElementById('s-badge');
+    const S_BADGE_MAIN = 'main-thread frame body: <b>0 B/frame - 0 major GC</b><br>proven by lite-gc-profiler';
+    const S_BADGE_WORKER = 'main-thread frame body: <b>0 B/frame - 0 major GC</b><br>+ young-gen return-leg rebind (not 0 B, 0 major GC)';
 
     const $zCanvas = document.getElementById('zbias-canvas');
     const $zB = document.getElementById('z-b'), $zBV = document.getElementById('z-bV');
@@ -766,6 +781,7 @@
             hud($sTp, f2(s.tProject));
             hud($sTs, f2(s.tSort));
             hud($sTpaint, f2(s.tPaint));
+            hud($sStalls, fmtN(s.offthreadStalls));
         }
     }
 
@@ -1051,6 +1067,45 @@
     $sN.addEventListener('input', () => {
         hud($sNV, fmtN(+$sN.value));
         setStressCount(+$sN.value);
+    });
+
+    /* D6 off-thread toggle. The Worker is built ONCE, lazily, on first enable
+       (cold path). useWorker(worker) binds the transferable round-trip; passing
+       null unbinds and reverts to the byte-identical on-thread frame body. Fails
+       CLOSED: if the Worker cannot be constructed or bound in this context (e.g. an
+       in-app browser that cannot resolve the worker's module graph), the toggle
+       reverts to main-thread and says so, never leaving the scene half-bound. */
+    let sWorker = null, sWorkerOn = false;
+    $sWorker.addEventListener('click', () => {
+        if (!sWorkerOn) {
+            try {
+                if (sWorker === null) {
+                    sWorker = new Worker(new URL('../DepthWorker.js', import.meta.url), {type: 'module'});
+                    sWorker.addEventListener('error', () => {
+                        sWorkerOn = false;
+                        sStage.useWorker(null);
+                        $sWorker.setAttribute('aria-pressed', 'false');
+                        $sWorkerState.textContent = 'unavailable';
+                        $sBadge.innerHTML = S_BADGE_MAIN;
+                    });
+                }
+                sStage.useWorker(sWorker);
+                sWorkerOn = true;
+                $sWorkerState.textContent = 'worker';
+                $sBadge.innerHTML = S_BADGE_WORKER;
+            } catch (e) {
+                sWorkerOn = false;
+                sWorker = null;
+                $sWorkerState.textContent = 'unavailable';
+                $sBadge.innerHTML = S_BADGE_MAIN;
+            }
+        } else {
+            sStage.useWorker(null);
+            sWorkerOn = false;
+            $sWorkerState.textContent = 'main';
+            $sBadge.innerHTML = S_BADGE_MAIN;
+        }
+        $sWorker.setAttribute('aria-pressed', String(sWorkerOn));
     });
 
     $zB.addEventListener('input', () => {

@@ -920,7 +920,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-depth"
 version_target: 1.6.0
-status: planned
+status: SHIPPED (v1.7.0, 2026-09-13)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -1275,5 +1275,74 @@ decoration, and a green suite over a hole is worse than no suite: it is the
 reason nobody looks there again. When the reviewer subagent reads a test, the
 question is not "does this test the feature" -- it is "would this test fail if
 the feature were broken".
+
+---
+
+## 8. Post-review backlog (approved 2026-09-13, after the v1.7.0 external review)
+
+Candidates, not yet authored briefs. Presentation items are D7-gated: they ship
+only after `LANE_VERSION` freezes the FLAGS namespace and the sort key, because
+each one either consumes a frozen bit or reads the frozen key. Every item keeps
+the four budget numbers (0 major / 0 minor / maxPauseMs 4 / 0 B/op) and the
+3-dep ceiling.
+
+APPROVED
+  - Per-node material override for selection / damage / LOD tint. The `matOverride`
+    Uint16 lane already exists (added in D5 for the shadow pass); expose a cold
+    `stage.setMaterialOverride(h, matId | -1)` that paint already honours. Nearly
+    free -- the lane and the paint read are built. Per-FACE override is explicitly
+    NOT approved: it needs a per-face lane and breaks the paint style-run batching.
+  - Hemisphere / rim shade modes (already in the D7 ride-along list): a second
+    LUT-indexed dot term on the existing world-normal shading, not a new per-face
+    branch. One shade-lane write, cold material bake.
+  - Blob ground shadows: a cheap dark ellipse under a caster, keyed like the D5
+    planar shadow. Approved as the pragmatic alternative to soft / multi-light
+    shadows (see REJECTED). Painter-ordered, flat, ~0 hot cost.
+  - Dash / line styles inside the existing style-run batch: pre-baked
+    `setLineDash` arrays per style run (already listed for D7).
+  - Telemetry counters for clip events and pick hits, matching the fail-closed
+    counter philosophy (`shadowFacesDrawn` is the precedent). Cold increments
+    only; no per-frame string build.
+  - High-DPR export path: `dpr` is already a first-class createStage/resize option
+    threaded into the paint `setTransform`; document the high-DPR ("export figure")
+    workflow (set dpr high, size the backing store to W*dpr x H*dpr) and add a
+    demo control. Docs + demo only -- no core change, fill/memory scales dpr^2.
+  - TypeScript surface + JSDoc examples for the post-1.3 APIs (clip, pick, tags,
+    shadows, dirtyRect, useWorker). Cold, zero-risk, docs-only.
+  - Flagship compound demo ("DEPTH // ATELIER" / "CITY"): one interactive scene
+    exercising hierarchy + world lighting + Motion + shadows + pick + layers +
+    clip + dirtyRect + telemetry + stress presets. Buildable in PART now; the
+    label / HUD / selection-panel pieces depend on the billboard draw path and so
+    are D7-era. Must obey demo-audit law (pre-allocated UI buffers, cached DOM,
+    pointer events, no toFixed / forced reflow in the rAF loop). It is an
+    integration showcase and a lite-layout-profiler target -- NOT a replacement
+    for `test/torture.mjs`, which stays the headless GC gate.
+  - Billboard draw path itself is already the D7-freeze forcing function (D-14):
+    the Billboard FLAGS bit is either consumed by a camera-facing quad pass at the
+    freeze or removed. Not a separate backlog item -- it lives in D7.
+
+REJECTED, in writing (rejection ledger)
+  - Runtime warnings when `facesOverflowed` / clip budget is hit. A per-frame
+    `console.warn` allocates and does I/O on the hot path and contradicts the
+    fail-closed-COUNTER philosophy the rest of the package uses. The counter is
+    the mechanism; capacity guidance is a DOCS fix, not a runtime warning.
+  - Debug-overlay draw helpers inside `Depth.js`. Even guarded / off-by-default,
+    they cost bytes in the single main file. They belong in the demo or a
+    `lite-depth-devtools` companion (mirroring `lite-layout-profiler` behind
+    `#profile`), never in core.
+  - Affine-textured / perspective quads. Canvas2D cannot map textures
+    perspective-correctly without subdivision; `drawImage`-per-face with a
+    transform is slow and allocation-prone, and it fights the flat-shaded
+    identity. Already a deferred stretch goal in D7; keep it there or drop it. If
+    pursued, it is its own package consuming the frozen LANES spec, not a core path.
+  - Soft / multi-light ground shadows. Multi-light multiplies the shadow pass and
+    the ordering complexity; "soft" without a buffer is faked. Blob shadows
+    (approved above) give most of the perceived value at ~0 cost.
+
+NOTE -- `@zakkster/lite-shadow` is NOT a fit for either shadow path: it is a 2D
+visibility-polygon raycaster for fog-of-war occlusion, a different problem from
+flatten-projecting 3D meshes onto y=0. It could only ever be a separate 2D
+screen-space lighting overlay composed via `view2d`, never a source of ground
+shadows.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

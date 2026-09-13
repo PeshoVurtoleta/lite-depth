@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.7.0
+# @zakkster/lite-depth v1.8.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -132,9 +132,14 @@ matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
     //                          // inverse-transpose too but are not counted here
     //       nodesOrphaned,     // nodes whose dead parent forced a ROOT reparent
     //       nodesTotal,        // live node count this frame
-    //       shadowFacesDrawn } // D5: flat ground-shadow faces painted this frame,
+    //       shadowFacesDrawn,  // D5: flat ground-shadow faces painted this frame,
     //                          // counted APART from facesDrawn so a caster is never
     //                          // double-counted (its own faces stay in facesDrawn)
+    //       offthreadStalls }  // D6: monotonic RUN counter of frames SKIPPED because
+    //                          // a bound Worker had not yet returned the transform
+    //                          // buffers (fail-closed stall; canvas keeps last paint).
+    //                          // Incremented on a stall, never reset in frame(). 0
+    //                          // when no Worker is bound.
 
 ## Per-node screen cull + dirty-rect (v1.5.0)
 
@@ -260,6 +265,56 @@ stage.view2d (Float64Array[6] or null): optional per-frame setTransform — the
     stage.useSignals({ effect });
     stage.bind(h, 'position'|'scale'|'quaternion', () => signalGetter());
 Effect writes lanes + marks dirty on the cold path; frame loop only reads lanes.
+
+## Off-thread transform (D6; opt-in DI)
+
+    import { Worker } from 'node:worker_threads';            // or a browser Worker
+    const worker = new Worker(new URL('@zakkster/lite-depth/DepthWorker.js', import.meta.url), { type: 'module' });
+    stage.useWorker(worker);   // bind; returns stage. useWorker(null) unbinds.
+
+Moves the transform pass (compose TRS -> local -> world in topo order) off the main
+thread via lite-arena's detach/rebind transferable round-trip. DepthWorker.js reuses
+Depth.js's mathKernels (composeTRS/mulAffine) and FLAGS -- it does not reimplement the
+math. Cold DI, mirrors useSignals(); default absent -> the frame body is byte-identical
+to the on-thread v1.6.0 path (one boolean gate at the top of frame() dispatches to a
+separate, never-inlined _offthreadFrame).
+
+Model (one-frame-latency pipeline, transfer is the fence -- one thread owns a buffer at
+a time; plain ArrayBuffer only, NO SharedArrayBuffer / atomics):
+  - Each frame projects the world matrices the Worker composed from the PREVIOUS send,
+    then transfers the current lanes out for the NEXT compose.
+  - PER-FRAME transfer set (ONE postMessage each direction): the 10 pose lanes
+    (px,py,pz,qx,qy,qz,qw,sx,sy,sz) + `flags` + the 12 world-matrix lanes (m0..m11),
+    plus the stage-owned worldNonUnif buffer. `flags` is transferred so the Worker
+    propagates the WORLD non-uniform bit (worldNonUnif) in topo order EXACTLY as the
+    on-thread loop does -- giving f64-EXACT shade parity across both backends,
+    including a non-uniform node and any child of a non-uniform parent.
+  - topo / parentDense are STRUCTURAL: the main thread keeps its own home copies and
+    sends the Worker COPIES once on bind, re-syncing only when stage.structureEpoch
+    changes -- never out-and-back per frame.
+
+Fail-closed (frame() NEVER reads a detached lane):
+  - Bootstrap: until one real reply has rebound composed matrices, frame 1 SENDS the
+    poses but SKIPS the project (offthreadStalls++) -- it never paints zero matrices.
+  - In-flight stall: if a frame runs while the lanes are still out at the Worker, the
+    WHOLE frame is skipped (offthreadStalls++); the canvas keeps its last paint.
+  - Unbind mid-flight: useWorker(null) while a send is in flight DEFERS -- the
+    off-thread path keeps stalling until the reply rebinds every lane, then the return
+    handler completes the switch to main-thread mode.
+  - A corrupt Worker reply is a loud crash: nodes.rebind validates every buffer
+    (type + exact capacity size) before repointing any.
+  - The cold pose setters (setPosition/setScale/setQuaternion/setEuler) THROW while a
+    send is in flight (pose lanes detached) rather than silently drop the write; issue
+    them while lanes are home (post-reply, or before useWorker()/after useWorker(null)).
+  - If the bound Worker dies or never replies while a send is in flight, useWorker(null)
+    cannot complete: frame() stalls (offthreadStalls climbs) indefinitely, with no
+    lane-recovery API -- a deliberate liveness/safety tradeoff. Never terminate a Worker
+    while a send is outstanding.
+
+Allocation: the main-thread frame BODY (project/collect/sort/paint + the send leg) is
+0 B/op. The return-leg rebind re-views the transferred-back buffers -- young-gen only,
+gated at 0 major GC over 20000 frames; it is not a 0-byte op. The Worker's transform
+runs on its own thread/heap and never touches the main-thread budget.
 
 ## Light
 

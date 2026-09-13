@@ -501,6 +501,54 @@ export function createStage(ctx, opts) {
   // context and leak minor GC on the always-on frame path. clipFace's only closure
   // state is _clipWrite (a Smi cursor), which never boxes.
 
+  /* -- D6 "Offthread": off-thread transform DI (lite-arena detach/rebind) -- */
+  // Optional Worker binding (cold, via useWorker). null = the transform pass runs
+  // on the main thread exactly as v1.6.0 (fail closed: null is not "no worker with
+  // buffers home" -- it is "no worker at all", the byte-identical hot path). When a
+  // Worker is bound, frame() dispatches to _offthreadFrame and the world-matrix
+  // compose leaves the main thread as a transferable round-trip.
+  let _worker = null;
+  let _workerAttached = null;   // the Worker we have already wired a return listener to
+  // "Primed" = at least one real reply has rebound composed world matrices. Until
+  // then m0..m11 are zero-initialized but NOT detached, so the isDetached stall gate
+  // alone would pass and project never-composed (zero) matrices on frame 1. This
+  // second gate fails that closed: the first project waits for real matrices home.
+  let _workerPrimed = false;
+  // Deferred-unbind latch. useWorker(null) while a send is in flight (lanes detached)
+  // must NOT drop straight to the main path -- that path would read byteLength-0
+  // views. We keep the off-thread path stalling until the in-flight reply rebinds,
+  // then the return handler completes the unbind. No frame() path ever reads a
+  // detached lane.
+  let _unbindPending = false;
+  // The PER-FRAME transferred lane set: 10 pose lanes (px..sz) the Worker composes a
+  // local TRS from, the 12 world-matrix lanes (m0..m11) it writes, and `flags` --
+  // added so the Worker can propagate the WORLD non-uniform bit (worldNonUnif) in
+  // topo order exactly as the main-thread transform loop does, giving f64-exact shade
+  // parity across both backends. Hoisted ONCE (a fresh array per frame would alloc).
+  const _sendLaneKeys = [
+    'px', 'py', 'pz', 'qx', 'qy', 'qz', 'qw', 'sx', 'sy', 'sz',
+    'm0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'm9', 'm10', 'm11',
+    'flags',
+  ];
+  // Reused per-frame send structures -- zero allocation on the send leg. `_sendLanes`
+  // is the field->buffer map the Worker rebinds from; `_sendMsg` the whole frame
+  // message; `_sendXfer` the transfer list (23 arena lane buffers + worldNonUnif =
+  // 24). All refilled in place each frame (property/element reassignment never
+  // reshapes the object, so no HeapNumber boxing, no fresh array).
+  const _sendLanes = {};
+  for (let i = 0; i < _sendLaneKeys.length; i++) _sendLanes[_sendLaneKeys[i]] = null;
+  const _sendMsg = { kind: 'f', seq: 0, lanes: _sendLanes, wnu: null };
+  const _sendXfer = new Array(_sendLaneKeys.length + 1);
+  let _sendSeq = 0;   // monotonic send sequence (wraps); echoed back for ordering checks
+  // topo / parentDense are STRUCTURAL, not per-frame: the Worker only READS them, and
+  // the main thread needs its OWN copies home every frame for its project pass. So
+  // they are COPIED to the Worker (never transferred out of the main thread) once on
+  // bind and re-synced ONLY when the structure epoch changes -- not out-and-back every
+  // frame. _workerTopoEpoch tracks the epoch the Worker last saw.
+  const _topoMsg = { kind: 't', count: 0, topo: null, parentDense: null };
+  const _topoXfer = new Array(2);
+  let _workerTopoEpoch = -1;
+
   const stage = {
     ctx, arena, nodes, camera: createCamera(o.camera),
     width: o.width || 800, height: o.height || 600, dpr: o.dpr || 1,
@@ -517,7 +565,7 @@ export function createStage(ctx, opts) {
     // path, no cost to the fully-front fast path either way.
     clipNear: true,
     _signals: null,
-    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0, shadowFacesDrawn: 0 },
+    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0, shadowFacesDrawn: 0, offthreadStalls: 0 },
     _topoDirty: true,
     // read-only views of the current draw ordering (observation handles only).
     // Accessors declared in the literal so they are part of the stage's initial
@@ -598,14 +646,29 @@ export function createStage(ctx, opts) {
     return h;
   };
 
-  stage.setPosition = (h, x, y, z) => { const d = nodes.idx(h), D = nodes.data; D.px[d] = x; D.py[d] = y; D.pz[d] = z; D.flags[d] |= F_DIRTY; };
+  // Cold-path fail-closed guard (D6): while a Worker transform round trip is in
+  // flight the pose/flags/m* lanes are transferred out (byteLength-0 views), so a
+  // write here would SILENTLY no-op and be lost on the next rebind -- failing open on
+  // an unverified state. Refuse it. One lane (px) is a valid probe because every
+  // per-frame lane detaches/rebinds atomically (same convention as _offthreadFrame's
+  // isDetached('m0')). Setters are never in the frame() hot body, so this costs the
+  // hot path nothing.
+  stage.setPosition = (h, x, y, z) => {
+    if (nodes.isDetached('px')) throw new Error('lite-depth: setPosition(h, ...) refused -- pose lanes are detached (a Worker transform round trip is in flight). Issue setters while lanes are home: after the Worker reply rebinds, or before useWorker()/after useWorker(null).');
+    const d = nodes.idx(h), D = nodes.data; D.px[d] = x; D.py[d] = y; D.pz[d] = z; D.flags[d] |= F_DIRTY;
+  };
   stage.setScale = (h, x, y, z) => {
+    if (nodes.isDetached('px')) throw new Error('lite-depth: setScale(h, ...) refused -- pose lanes are detached (a Worker transform round trip is in flight). Issue setters while lanes are home: after the Worker reply rebinds, or before useWorker()/after useWorker(null).');
     const d = nodes.idx(h), D = nodes.data; D.sx[d] = x; D.sy[d] = y === undefined ? x : y; D.sz[d] = z === undefined ? x : z;
     D.flags[d] |= F_DIRTY;
     if (x === D.sy[d] && x === D.sz[d]) D.flags[d] &= ~F_NONUNIF; else D.flags[d] |= F_NONUNIF;
   };
-  stage.setQuaternion = (h, x, y, z, w) => { const d = nodes.idx(h), D = nodes.data; D.qx[d] = x; D.qy[d] = y; D.qz[d] = z; D.qw[d] = w; D.flags[d] |= F_DIRTY; };
+  stage.setQuaternion = (h, x, y, z, w) => {
+    if (nodes.isDetached('px')) throw new Error('lite-depth: setQuaternion(h, ...) refused -- pose lanes are detached (a Worker transform round trip is in flight). Issue setters while lanes are home: after the Worker reply rebinds, or before useWorker()/after useWorker(null).');
+    const d = nodes.idx(h), D = nodes.data; D.qx[d] = x; D.qy[d] = y; D.qz[d] = z; D.qw[d] = w; D.flags[d] |= F_DIRTY;
+  };
   stage.setEuler = (h, ex, ey, ez) => {
+    if (nodes.isDetached('px')) throw new Error('lite-depth: setEuler(h, ...) refused -- pose lanes are detached (a Worker transform round trip is in flight). Issue setters while lanes are home: after the Worker reply rebinds, or before useWorker()/after useWorker(null).');
     const cx = Math.cos(ex / 2), sx = Math.sin(ex / 2), cy = Math.cos(ey / 2), sy = Math.sin(ey / 2), cz = Math.cos(ez / 2), sz = Math.sin(ez / 2);
     const d = nodes.idx(h), D = nodes.data;
     D.qw[d] = cx * cy * cz + sx * sy * sz; D.qx[d] = sx * cy * cz - cx * sy * sz;
@@ -691,6 +754,65 @@ export function createStage(ctx, opts) {
           : null;
     if (!setter) throw new Error('lite-depth: unknown bind channel ' + channel);
     stage._signals.effect(() => setter(get()));   // cold effect; writes lanes + marks dirty
+  };
+
+  /* -- cold: off-thread transform DI (D6 "Offthread") -- */
+  // The return-leg handler. A Worker transferred the pose + world-matrix + flags
+  // lanes (rebindable arena fields) and the stage-owned worldNonUnif buffer back;
+  // rebind/re-view them so the NEXT frame() finds the lanes home and runs the project
+  // pass over the freshly-composed world matrices AND the parity-correct world
+  // non-uniform bit. Fail closed: nodes.rebind validates EVERY buffer (type + exact
+  // capacity size) before repointing ANY, and throws (naming the field) on a garbage
+  // buffer -- not caught, a corrupt Worker reply is a loud crash, never a silent
+  // mis-render. worldNonUnif is stage-owned (not an arena field), so it is repointed
+  // by a fresh view here. topo / parentDense are NOT in the round trip (structural;
+  // sent as copies). Sets _workerPrimed so the FIRST project waits for real matrices.
+  function _onWorkerReturn(msg) {
+    if (msg === null || typeof msg !== 'object') return;   // ignore a non-frame control ping
+    const lanes = msg.lanes;
+    if (lanes) nodes.rebind(lanes);
+    if (msg.wnu) worldNonUnif = new Uint8Array(msg.wnu);
+    _workerPrimed = true;
+    // Complete a deferred unbind: the in-flight reply has rebound every lane, so the
+    // main path may now run without touching a detached view. Drop off-thread mode.
+    if (_unbindPending) { _worker = null; _unbindPending = false; _workerPrimed = false; }
+  }
+  // Bind (or, with null, unbind) a Worker that runs the transform pass. Opt-in and
+  // DI, mirroring useSignals: cold, returns stage. The Worker must speak the
+  // DepthWorker.js protocol (composeTRS -> local -> world + worldNonUnif over the
+  // transferred lanes in topo order, then transfer the buffers back). We attach the
+  // return listener for BOTH shapes: node:worker_threads (EventEmitter .on('message',
+  // msg)) and the browser Worker (addEventListener('message', ev) -> ev.data). Fail
+  // closed on a non-Worker-shaped argument with a did-you-mean hint.
+  stage.useWorker = (worker) => {
+    if (worker === null || worker === undefined) {
+      // Unbind. If a send is in flight (lanes detached at the Worker), DEFER: keep the
+      // off-thread path bound so frame() keeps stalling until the reply rebinds every
+      // lane, then _onWorkerReturn completes the unbind. Never expose the main path to
+      // a detached lane. If buffers are home, unbind immediately.
+      if (_worker !== null && nodes.isDetached('m0')) { _unbindPending = true; return stage; }
+      _worker = null; _unbindPending = false; _workerPrimed = false; _workerTopoEpoch = -1;
+      return stage;
+    }
+    if (typeof worker.postMessage !== 'function') {
+      throw new Error('lite-depth: useWorker(worker) needs a Worker-shaped object with a ' +
+        'postMessage(msg, transferList) method (node:worker_threads Worker or a browser Worker) -- ' +
+        'got ' + (typeof worker) + '. Pass null to unbind.');
+    }
+    // Attach the return listener ONCE per distinct Worker (re-binding the same
+    // Worker -- e.g. a demo toggle off then on -- must not stack duplicate listeners
+    // that would rebind the same reply twice per frame).
+    if (worker !== _workerAttached) {
+      if (typeof worker.on === 'function') worker.on('message', _onWorkerReturn);          // node worker_threads
+      else if (typeof worker.addEventListener === 'function') worker.addEventListener('message', (ev) => _onWorkerReturn(ev.data)); // browser
+      else throw new Error('lite-depth: useWorker(worker) -- the Worker exposes neither .on("message") ' +
+        'nor .addEventListener("message"); cannot receive the transform round-trip reply.');
+      _workerAttached = worker;
+    }
+    _worker = worker;
+    _unbindPending = false;
+    _workerTopoEpoch = -1;   // force a topo/parentDense re-sync to THIS binding
+    return stage;
   };
 
   /* -- cold: spatial-index DI (lite-bvh, DI-bound never a runtime dep) -- */
@@ -966,6 +1088,11 @@ export function createStage(ctx, opts) {
   /* ── hot: frame ── */
   const clock = (typeof performance !== 'undefined' && performance.now) ? performance : Date;
   stage.frame = (dt) => {
+    // D6 gate: ONE boolean at the very top. With a Worker bound the transform pass
+    // is composed off-thread, so this frame dispatches to _offthreadFrame (a
+    // SEPARATE function -- never inlined here, so V8 keeps this hot body byte-
+    // identical to v1.6.0 for the default no-worker path). null is not "home".
+    if (_worker !== null) return _offthreadFrame(dt);
     const D = nodes.data, count = nodes.count;
     if (stage._topoDirty) rebuildTopo();
     const st = stage.stats;
@@ -1312,6 +1439,374 @@ export function createStage(ctx, opts) {
     return stage.stats;
   };
 
+/* -- hot (off-thread transform): frame() dispatch when a Worker is bound -- */
+  // A SEPARATE function from frame() so V8 never inlines this off-thread machinery
+  // into the default hot loop. The transform pass is GONE from the main thread here:
+  // the Worker composed the world matrices from the PREVIOUS frame's send, so this
+  // body is frame()'s project -> collect -> sort -> paint pipeline verbatim (minus
+  // the transform loop), bracketed by ONE isDetached stall gate at the top and ONE
+  // postMessage send leg at the bottom.
+  function _offthreadFrame(dt) {
+    const st = stage.stats;
+    // Fail-closed stall gate 1 (the DECIDED design): if the per-frame lanes are still
+    // out at the Worker (buffers transferred, not yet rebound), reading any world or
+    // pose lane now would be a detached read. SKIP THE WHOLE FRAME -- the canvas
+    // retains its last painted frame -- and bump the monotonic stall counter. ONE
+    // isDetached probe per frame, never in a loop. offthreadStalls is a run counter:
+    // incremented here, NEVER reset inside a frame body.
+    if (nodes.isDetached('m0')) { st.offthreadStalls++; return st; }
+    const count = nodes.count;
+    // topo / parentDense stay HOME on the main thread every frame (they are copied to
+    // the Worker, never transferred out), so rebuildTopo always writes live buffers.
+    if (stage._topoDirty) rebuildTopo();
+    // Structural re-sync: hand the Worker fresh topo/parentDense COPIES on bind and
+    // whenever the structure epoch changed. Cold (rare); one-way (the Worker stores
+    // them and never replies to this message). Ordered before any frame message, so
+    // the Worker always has current topo before it composes.
+    if (_structureEpoch !== _workerTopoEpoch) _syncTopo(count);
+    // Fail-closed stall gate 2 (bootstrap): m0..m11 are zero-initialized but NOT
+    // detached before the first reply. Projecting them would paint never-composed
+    // (zero) matrices -- there is no "previous send" on frame 1. Until a real reply
+    // has rebound composed matrices (_workerPrimed), SEND the poses so the Worker can
+    // compose, then SKIP the project and count the frame as a stall.
+    if (!_workerPrimed) { _offthreadSend(count); st.offthreadStalls++; return st; }
+    const D = nodes.data;
+    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0; st.shadowFacesDrawn = 0;
+    st.facesOverflowed = 0; st.nodesInvalid = 0; st.nodesNonUniform = 0; st.nodesTotal = count;
+
+    // cache lane refs (monomorphic locals)
+    const px = D.px, py = D.py, pz = D.pz, qx = D.qx, qy = D.qy, qz = D.qz, qw = D.qw, sx = D.sx, sy = D.sy, sz = D.sz;
+    const m0 = D.m0, m1 = D.m1, m2 = D.m2, m3 = D.m3, m4 = D.m4, m5 = D.m5, m6 = D.m6, m7 = D.m7, m8 = D.m8, m9 = D.m9, m10 = D.m10, m11 = D.m11;
+    const flags = D.flags, geomL = D.geom, matL = D.mat, layerL = D.layer, biasL = D.bias;
+    // transform is composed OFF-THREAD; the world matrices in m0..m11 are the
+    // Worker's reply to the previous send. No main-thread transform loop.
+    st.tTransform = 0;
+    let t;
+
+    t = clock.now();
+    const cam = stage.camera, V = cam.view;
+    const near = cam.near, far = cam.far;
+    const halfW = stage.width * 0.5, halfH = stage.height * 0.5;
+    const ortho = cam.ortho;   // orthographic projection lives on the camera, not the stage
+    const focal = ortho ? 0 : (0.5 * Math.min(stage.width, stage.height)) / Math.tan(cam.fov * 0.5);
+    const orthoK = (Math.min(stage.width, stage.height) * 0.5) / cam.orthoScale;
+    const zSpan = (far - near) || 1;         // positive span; maps viewZ [-far,-near] -> [0, DEPTH_MAX]
+    // Reset the per-frame clipXY write cursor (a Smi; safe to write to the shared
+    // clipFace context). Projection scalars are passed to clipFace as arguments,
+    // not captured -- see the note by _clipWrite's declaration.
+    _clipWrite = 0;
+    // directional light, hoisted once above the node loop. Shade is now baked into
+    // the shadeL lane in this pass (per node: back-rotate the light through the
+    // WORLD upper-3x3; per face: one dot). paint() no longer touches the light.
+    const light = stage.light, lgx = light[0], lgy = light[1], lgz = light[2];
+    // Cached viewport cull scalars -> frame locals. The per-face viewport test is
+    // four inline compares against these (was aabb2.set + aabb2.intersects).
+    const vx0 = _vx0, vy0 = _vy0, vx1 = _vx1, vy1 = _vy1;
+    // Opt-in dirty-rect lane, hoisted once (a per-node read would cost bytes every
+    // node). When on, seed every LIVE node's box empty so any node the loop skips
+    // (invisible / invalid / overflowed / node-culled / fail-open) contributes the
+    // merge identity to the scene bbox; drawn nodes overwrite their slot below.
+    // A bound spatial index FORCES the box lane on: nodeBox is written only under
+    // wantBox, and pick reads it -- an index that did not force it would broadphase
+    // over stale/empty boxes. So wantBox = dirtyRect OR an index is bound.
+    const wantBox = stage.dirtyRect === true || _index !== null;
+    // Near-clip toggle, hoisted once (a per-face read would cost bytes). Only ever
+    // consulted on the cold straddle branch below.
+    const doClip = stage.clipNear !== false;
+    if (wantBox) {
+      for (let d = 0; d < count; d++) { const j = d << 2; nodeBox[j] = Infinity; nodeBox[j + 1] = Infinity; nodeBox[j + 2] = -Infinity; nodeBox[j + 3] = -Infinity; }
+    }
+    // D5 per-frame cull stamp. A node whose cullStamp equals this value was
+    // screen/depth-culled THIS frame (set at the two continue sites below). Bumped
+    // once (cold); 0 is reserved as "never culled", so on the 2^32 wrap the lane is
+    // cleared and the stamp restarts at 1 -- no stale 0 can read as culled.
+    const stamp = _frameStamp = ((_frameStamp + 1) >>> 0) || (cullStamp.fill(0), 1);
+    let vc = 0, dc = 0;
+
+    for (let i = 0; i < count; i++) {
+      const d = topo[i];
+      if ((flags[d] & F_VISIBLE) === 0) continue;
+      const g = geometries[geomL[d]];
+
+      // cheap per-node frustum reject: transform world centre to view space
+      const wcx = m3[d], wcy = m7[d], wcz = m11[d];
+      const cvz = V[8] * wcx + V[9] * wcy + V[10] * wcz + V[11];
+      const rad = g.radius * Math.max(sx[d], sy[d], sz[d]);
+      const bias = biasL[d];
+      // fail-closed node door (D-06): a NaN/Infinity in any pose lane laundered
+      // this far poisons the projection and (via quantize) the sort key. ONE
+      // finiteness gate per NODE -- never per face -- rejects the whole node,
+      // counts it, and moves on. NaN is a REJECT, not a silent far-plane paint.
+      if (!(Number.isFinite(wcx) && Number.isFinite(wcy) && Number.isFinite(wcz) &&
+            Number.isFinite(cvz) && Number.isFinite(rad) && Number.isFinite(bias))) {
+        st.nodesInvalid++; continue;
+      }
+      if (cvz - rad > -near || cvz + rad < -far) { cullStamp[d] = stamp; st.nodesCulled++; continue; }
+
+      // overflow door (D-07): two integer compares per NODE, hoisted above both
+      // inner loops. If this node's verts or faces would run past the frame-arena
+      // budgets, skip it whole -- no partial/out-of-range write -- and count it.
+      if (vc + g.V > maxVerts || dc + g.drawSlots > maxDrawFaces) { st.facesOverflowed++; continue; }
+
+      vertBase[d] = vc;
+      const gv = g.verts, GV = g.V;
+      const M0 = m0[d], M1 = m1[d], M2 = m2[d], M3 = m3[d], M4 = m4[d], M5 = m5[d], M6 = m6[d], M7 = m7[d], M8 = m8[d], M9 = m9[d], M10 = m10[d], M11 = m11[d];
+      // Node screen-box registers: union over FRONT-OF-NEAR verts only (see below).
+      let nbMinX = Infinity, nbMinY = Infinity, nbMaxX = -Infinity, nbMaxY = -Infinity;
+      for (let v = 0; v < GV; v++) {
+        const lx = gv[v * 3], ly = gv[v * 3 + 1], lz = gv[v * 3 + 2];
+        const wx = M0 * lx + M1 * ly + M2 * lz + M3;
+        const wy = M4 * lx + M5 * ly + M6 * lz + M7;
+        const wz = M8 * lx + M9 * ly + M10 * lz + M11;
+        const vx = V[0] * wx + V[1] * wy + V[2] * wz + V[3];
+        const vy = V[4] * wx + V[5] * wy + V[6] * wz + V[7];
+        const vz = V[8] * wx + V[9] * wy + V[10] * wz + V[11];
+        const idx = vc + v;
+        viewZ[idx] = vz;
+        let sX, sY;
+        if (ortho) { sX = halfW + vx * orthoK; sY = halfH - vy * orthoK; }
+        else { const inv = focal / (-vz); sX = halfW + vx * inv; sY = halfH - vy * inv; }
+        screenXY[idx * 2] = sX; screenXY[idx * 2 + 1] = sY;
+        // Accumulate the node's screen box over FRONT-OF-NEAR verts ONLY (z<=-near).
+        // A behind-near vert projects to +/-Infinity/garbage; folding it in would
+        // poison the box and wrongly drop a visible node -- so it is excluded here
+        // and the node-box door below fails OPEN on an empty/non-finite box.
+        if (vz <= -near) {
+          if (sX < nbMinX) nbMinX = sX; if (sX > nbMaxX) nbMaxX = sX;
+          if (sY < nbMinY) nbMinY = sY; if (sY > nbMaxY) nbMaxY = sY;
+        }
+      }
+      vc += GV;
+
+      if ((flags[d] & F_STROKE) !== 0) {
+        // Strokes are NOT node-box-culled: a polyline may cross the viewport
+        // between two off-screen endpoints, so v1.4.0 stroke behaviour is kept.
+        // Still feed the dirty-rect lane when a valid box exists.
+        if (wantBox && nbMinX <= nbMaxX && nbMinY <= nbMaxY) {
+          const j = d << 2;
+          nodeBox[j] = froundOut(nbMinX, -1); nodeBox[j + 1] = froundOut(nbMinY, -1);
+          nodeBox[j + 2] = froundOut(nbMaxX, 1); nodeBox[j + 3] = froundOut(nbMaxY, 1);
+        }
+        // one draw entry for the whole polyline at its centre depth
+        drawKey[dc] = packKey(layerL[d], quantize(cvz + bias, near, far, zSpan));
+        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; matOverride[dc] = matL[d]; dc++;
+        continue;
+      }
+
+      // Per-node screen-space AABB cull (fills). Two DELIBERATELY OPPOSITE doors:
+      //   node-box empty/non-finite => DRAW (fail OPEN): a wrongly-fired geometry
+      //     cull LOSES PICTURE, so an unbuildable box errs toward drawing. The face
+      //     loop's own per-face near cull then rejects the behind-near faces, so the
+      //     facesCulled tally is byte-identical to v1.4.0 for such a node.
+      //   face-bound NaN (in the face loop below) => CULL (fail CLOSED): losing a
+      //     degenerate face is safe.
+      // A VALID box that misses the viewport culls the whole node: nodesCulled +1
+      // and the face loop runs ZERO iterations.
+      if (nbMinX <= nbMaxX && nbMinY <= nbMaxY) {           // valid, non-empty, finite
+        if (!(nbMinX <= vx1 && nbMaxX >= vx0 && nbMinY <= vy1 && nbMaxY >= vy0)) {
+          cullStamp[d] = stamp; st.nodesCulled++; continue;  // nodeBox stays empty (pre-pass)
+        }
+        if (wantBox) {
+          const j = d << 2;
+          nodeBox[j] = froundOut(nbMinX, -1); nodeBox[j + 1] = froundOut(nbMinY, -1);
+          nodeBox[j + 2] = froundOut(nbMaxX, 1); nodeBox[j + 3] = froundOut(nbMaxY, 1);
+        }
+      }
+      // else: empty/non-finite node box -> FAIL OPEN, fall through and draw.
+
+      // Per-node shade setup (D-03/D-04), hoisted ABOVE the face loop and computed
+      // ONCE per node. Shade = clamp(dot(normalize(worldNormal), light), 0, 1),
+      // where worldNormal transforms the local face normal by the node's WORLD
+      // basis -- the same transform the geometry is drawn from. Two per-node paths,
+      // selected by the PROPAGATED world non-uniform bit (own local scale OR any
+      // non-uniform ancestor -- an inherited non-uniform basis is not a similarity
+      // either), NOT the static local F_NONUNIF:
+      //   - Uniform (common, tainted === 0): W = s*R is a similarity, so
+      //     |W*n| = s is CONSTANT across faces. Fold it once: back-rotate the light
+      //     Lb = (W^T * light) / s, and each face is a single sqrt-free dot
+      //     dot(n, Lb) == dot(normalize(W*n), light).
+      //   - Non-uniform (tainted !== 0, D-04): |N*n| VARIES per face, so it cannot
+      //     be folded out. Build the normal matrix N = cofactor(W)/det (row-major,
+      //     the same inverse-transpose gl-matrix's normalFromMat4 builds) ONCE into
+      //     _NM here; each face then does N*n, normalize, dot -- the per-face sqrt
+      //     is paid only by tainted nodes, never by the uniform majority.
+      const matK1 = materials[matL[d]].K - 1;
+      const tainted = worldNonUnif[d];   // branch selector: own OR inherited non-uniform
+      let Lbx = 0, Lby = 0, Lbz = 0;
+      if (tainted !== 0) {
+        // Counter tracks own LOCAL non-uniform nodes (the D-04 feature / F_NONUNIF
+        // flag), NOT inherited taint: a locally-uniform child under a non-uniform
+        // parent is shaded via the inverse-transpose (correct) but is not itself a
+        // "non-uniform node". own-flag set implies tainted, so this is a subset.
+        if ((flags[d] & F_NONUNIF) !== 0) st.nodesNonUniform++;
+        const C00 = M5 * M10 - M6 * M9, C01 = -(M4 * M10 - M6 * M8), C02 = M4 * M9 - M5 * M8;
+        const C10 = -(M1 * M10 - M2 * M9), C11 = M0 * M10 - M2 * M8, C12 = -(M0 * M9 - M1 * M8);
+        const C20 = M1 * M6 - M2 * M5, C21 = -(M0 * M6 - M2 * M4), C22 = M0 * M5 - M1 * M4;
+        const det = M0 * C00 + M1 * C01 + M2 * C02;
+        const invDet = det !== 0 ? 1 / det : 0;   // singular upper-3x3 -> zero normal -> ambient floor
+        // N = cofactor / det (NOT transposed): N*n gives the world normal direction.
+        _NM[0] = C00 * invDet; _NM[1] = C01 * invDet; _NM[2] = C02 * invDet;
+        _NM[3] = C10 * invDet; _NM[4] = C11 * invDet; _NM[5] = C12 * invDet;
+        _NM[6] = C20 * invDet; _NM[7] = C21 * invDet; _NM[8] = C22 * invDet;
+      } else {
+        const s2 = M0 * M0 + M4 * M4 + M8 * M8;
+        const invS = s2 > 0 ? 1 / Math.sqrt(s2) : 1;
+        Lbx = (M0 * lgx + M4 * lgy + M8 * lgz) * invS;
+        Lby = (M1 * lgx + M5 * lgy + M9 * lgz) * invS;
+        Lbz = (M2 * lgx + M6 * lgy + M10 * lgz) * invS;
+      }
+
+      // faces
+      const base = vertBase[d], off = g.faceVertOffset, fv = g.faceVerts, F = g.F, fn = g.faceNormal;
+      for (let fi = 0; fi < F; fi++) {
+        const o0 = off[fi], o1 = off[fi + 1], n = o1 - o0;
+        // near cull: any vertex in front of near plane
+        let nearBad = false, czSum = 0;
+        let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+        for (let j = o0; j < o1; j++) {
+          const vi = base + fv[j], z = viewZ[vi];
+          if (z > -near) { nearBad = true; break; }
+          czSum += z;
+          const X = screenXY[vi * 2], Y = screenXY[vi * 2 + 1];
+          if (X < minx) minx = X; if (X > maxx) maxx = X; if (Y < miny) miny = Y; if (Y > maxy) maxy = Y;
+        }
+        // A vertex touched/crossed the near plane. The fully-front fast path (no
+        // break above) is byte-identical to v1.5.1; the near-touching face drops to
+        // the COLD clip helper, which decides straddle-vs-fully-behind by a full
+        // re-scan (order-independent) and either emits a near-clipped polygon
+        // (dc + 1) or rejects the whole face (facesCulled + 1). All clip bytes live
+        // in clipFace, not this loop -- a scene with no straddling face never calls it.
+        if (nearBad) {
+          // A vertex is behind the near plane. Only a face that ALSO has a front
+          // vertex STRADDLES and needs clipping; a fully-behind face is culled
+          // exactly as v1.5.1 -- no clip work and no clip-scratch allocation, so a
+          // scene of behind-near faces keeps the baseline footprint. The straddle
+          // probe (breaks on the first front vert) is on this cold branch only.
+          let straddles = false;
+          if (doClip) { for (let j = o0; j < o1; j++) { if (viewZ[base + fv[j]] <= -near) { straddles = true; break; } } }
+          if (straddles) dc = clipFace(dc, d, fi, near, far, zSpan, tainted, Lbx, Lby, Lbz, matK1, bias, layerL[d], halfW, halfH, focal, ortho, orthoK);
+          else st.facesCulled++;
+          continue;
+        }
+        // viewport cull, inline (was aabb2.set + aabb2.intersects). Byte-identical
+        // to the intersects predicate against the cached viewport scalars. A NaN
+        // face bound makes a compare false => the face is culled = FAIL CLOSED
+        // (losing a degenerate face is safe; the inverse of the node-box door).
+        if (!(minx <= vx1 && maxx >= vx0 && miny <= vy1 && maxy >= vy0)) { st.facesCulled++; continue; }
+        // backface cull via screen winding (signed area), unless double-sided
+        const a0 = base + fv[o0], a1 = base + fv[o0 + 1], a2 = base + fv[o0 + 2];
+        const ax = screenXY[a0 * 2], ay = screenXY[a0 * 2 + 1];
+        const bx = screenXY[a1 * 2], by = screenXY[a1 * 2 + 1];
+        const cx2 = screenXY[a2 * 2], cy2 = screenXY[a2 * 2 + 1];
+        // screen Y is flipped (y-down), which inverts polygon winding: outward
+        // (front) faces read as negative signed area. Keep those; cull the rest.
+        const area = (bx - ax) * (cy2 - ay) - (cx2 - ax) * (by - ay);
+        if (area >= 0 && (flags[d] & F_DOUBLE) === 0) { st.facesCulled++; continue; }
+        const cz = czSum / n + bias;
+        drawKey[dc] = packKey(layerL[d], quantize(cz, near, far, zSpan));
+        drawNode[dc] = d; drawFace[dc] = fi; matOverride[dc] = matL[d];
+        // bake the shade into the draw lane. Uniform: one sqrt-free dot with the
+        // back-rotated light (which already carries the world transform). Tainted:
+        // transform the local normal by the per-node normal matrix, normalize, and
+        // dot with the light -- the exact normalized inverse-transpose. The branch
+        // is per-node-constant (predictable); the sqrt lands only on tainted nodes.
+        const nx = fn[fi * 3], ny = fn[fi * 3 + 1], nz = fn[fi * 3 + 2];
+        let ndl;
+        if (tainted !== 0) {
+          const wx = _NM[0] * nx + _NM[1] * ny + _NM[2] * nz;
+          const wy = _NM[3] * nx + _NM[4] * ny + _NM[5] * nz;
+          const wz = _NM[6] * nx + _NM[7] * ny + _NM[8] * nz;
+          const ln2 = wx * wx + wy * wy + wz * wz;
+          if (ln2 > 0) { const invL = 1 / Math.sqrt(ln2); ndl = (wx * lgx + wy * lgy + wz * lgz) * invL; }
+          else ndl = 0;
+        } else {
+          ndl = nx * Lbx + ny * Lby + nz * Lbz;
+        }
+        if (ndl < 0) ndl = 0; else if (ndl > 1) ndl = 1;
+        shadeL[dc] = (ndl * matK1) | 0;
+        dc++;
+      }
+    }
+    st.tProject = clock.now() - t;
+
+    // D5 secondary passes (COLD, O(members) -- never O(scene)). Reconcile the Culled
+    // tag from this frame's cull stamps whenever any flag-backed tag has members, so
+    // both the shadow pass and a post-frame pickSet see fresh membership. Then, if a
+    // shadow material is set, flatten-project every non-culled ShadowCaster onto the
+    // ground and append the shadow polygons to the SAME draw list (before the sort).
+    if (ShadowCaster.count !== 0 || Pickable.count !== 0) syncCulled(stamp);
+    if (_shadowMat >= 0 && ShadowCaster.count !== 0) {
+      dc = shadowPass(dc, near, far, zSpan, halfW, halfH, focal, ortho, orthoK, lgx, lgy, lgz);
+    }
+
+    // Opt-in scene-bbox merge (dirty-rect lane). Snapshot last frame's union into
+    // _prevBox for a redraw delta, then fold THIS frame's node boxes into _sceneBox
+    // once (count-bounded; skipped/culled slots are the empty merge identity, so a
+    // fully-empty frame yields the canonical empty box). Off => zero added cost.
+    if (wantBox) { aabb2.copy(_prevBox, _sceneBox); aabb2.mergeAll(_sceneBox, nodeBox, count); }
+
+    // Rebuild the bound spatial index from this frame's completed node boxes (all
+    // written above under the forced box lane). clear()+insertLeaves; zero-alloc.
+    if (_index !== null) rebuildIndex(count);
+
+    /* radix sort permutation of [0,dc) by drawKey (LSD, 4x8-bit) */
+    t = clock.now();
+    let src = orderA, dst = orderB;
+    for (let i = 0; i < dc; i++) src[i] = i;
+    for (let shift = 0; shift < 32; shift += 8) {
+      hist.fill(0);
+      for (let i = 0; i < dc; i++) hist[(drawKey[src[i]] >>> shift) & 0xFF]++;
+      let sum = 0; for (let b = 0; b < 256; b++) { const c = hist[b]; hist[b] = sum; sum += c; }
+      for (let i = 0; i < dc; i++) { const k = (drawKey[src[i]] >>> shift) & 0xFF; dst[hist[k]++] = src[i]; }
+      const tmp = src; src = dst; dst = tmp;
+    }
+    st.tSort = clock.now() - t;
+
+    /* expose sorted draw list (cheap; used by tests + HUD) -- re-point the
+       read-only backing vars, no allocation */
+    _pubOrder = src; _pubDrawCount = dc;
+
+    /* paint */
+    t = clock.now();
+    paint(src, dc);
+    st.tPaint = clock.now() - t;
+
+    // -- send leg: hand the fresh poses + flags + worldNonUnif to the Worker for the
+    // NEXT transform. ONE postMessage, ONE transfer list. The transfer detaches every
+    // listed buffer on the main side, so the next frame() stalls until the reply rebinds.
+    _offthreadSend(count);
+    return st;
+  }
+
+  // Zero-allocation per-frame send: refill the reused lane->buffer map + transfer list
+  // from the CURRENT arena views (each return leg minted fresh views over the returned
+  // buffers, so re-read .buffer every frame) plus the stage-owned worldNonUnif buffer,
+  // then post ONE message. All send structures (_sendLanes/_sendMsg/_sendXfer) are
+  // hoisted and refilled in place -- no fresh array, no object reshape, no boxing.
+  function _offthreadSend(count) {
+    const data = nodes.data, keys = _sendLaneKeys, lanes = _sendLanes, xfer = _sendXfer;
+    for (let i = 0; i < keys.length; i++) { const b = data[keys[i]].buffer; lanes[keys[i]] = b; xfer[i] = b; }
+    const wb = worldNonUnif.buffer;
+    _sendMsg.wnu = wb; xfer[keys.length] = wb;
+    _sendMsg.seq = _sendSeq = (_sendSeq + 1) >>> 0;
+    _worker.postMessage(_sendMsg, xfer);
+  }
+
+  // Cold structural sync: COPY topo/parentDense to the Worker (main keeps its own home
+  // for the project pass) so the Worker can iterate topo order + read parents without
+  // an out-and-back transfer every frame. One-way: the Worker stores them and does not
+  // reply. Copies are minted here (cold; slice()), so the main-thread views are never
+  // transferred and never detached. Sent on bind and on every structure-epoch change.
+  function _syncTopo(count) {
+    const tcopy = topo.slice(), pcopy = parentDense.slice();
+    _topoMsg.count = count;
+    _topoMsg.topo = tcopy.buffer; _topoMsg.parentDense = pcopy.buffer;
+    _topoXfer[0] = tcopy.buffer; _topoXfer[1] = pcopy.buffer;
+    _worker.postMessage(_topoMsg, _topoXfer);
+    _workerTopoEpoch = _structureEpoch;
+  }
+
+
   function packKey(layer, depth) { return (((layer & 63) << LAYER_SHIFT) | (depth & DEPTH_MAX)) >>> 0; }
   function quantize(z, near, far, zSpan) {
     // z is view-space (negative), within [-far, -near]. Map the far plane -> 0
@@ -1618,4 +2113,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.7.0';
+export const version = '1.8.0';
