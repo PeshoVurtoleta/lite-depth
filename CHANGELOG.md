@@ -4,6 +4,84 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-09-13
+
+Roadmap D7 "Freeze": the frozen binary contract. `LANE_VERSION = 1` is published
+and LANES.md records the normative lane/wire/sort-key spec. No hot-path layout
+changed -- the sort key, the linear quantize curve, the 6/26 layer split, the
+per-node lane set, and the Worker wire are all frozen exactly as they shipped in
+1.9.0. The two residual layout decisions were ruled on measured evidence (tables
+below); both froze the incumbent.
+
+### Breaking
+
+- **Layer out-of-range now THROWS.** `stage.setLayer(h, layer)` and
+  `addNode(geom, mat, { layer })` previously accepted any value and silently
+  `& 63`-wrapped it (setLayer) or deferred the wrap to packKey (addNode). Both
+  doors now fail closed: a `layer` outside `0..63` (or `NaN`/non-numeric) throws
+  with the valid range and a did-you-mean hint, consistent with the other
+  fail-closed setters. The guard is on the COLD path (setLayer/addNode) only --
+  no per-frame cost. packKey's defensive `& 63` mask stays but is now unreachable
+  with a bad value. Migration: clamp or validate layer at the call site; the
+  suite's peak layer is 3, so in-range callers are unaffected.
+
+### Added
+
+- **`LANE_VERSION` (exported const, value 1).** The frozen binary-contract
+  version, on a SEPARATE axis from semver `version` -- the two never track each
+  other. Covers the per-node arena lane set (names + TypedArray types), the FLAGS
+  bit assignment, the packKey sort-key layout (6 layer bits << 26 | 26 depth bits)
+  + the linear-in-viewZ quantize curve, the frame-arena layout + the 3 cold draw
+  sentinels, and the D6 Worker wire (23-key transfer set + worldNonUnif). Does NOT
+  cover: stats field values or additive stats fields (a minor bump), geometry-store
+  fields, capacity options, the packed node-box layout (delegated to lite-aabb
+  FORMAT_VERSION), or Motion.js. Normative spec: LANES.md (now shipped in `files[]`).
+
+### Freeze record (not behavioral changes)
+
+- **`stats` shape frozen at 17 fields** (`Depth.js`): `facesDrawn, facesCulled,
+  nodesCulled, drawCalls, tTransform, tProject, tSort, tPaint, facesOverflowed,
+  nodesInvalid, nodesNonUniform, nodesOrphaned, nodesTotal, shadowFacesDrawn,
+  offthreadStalls, facesClipped, pickHits`. Axis is
+  explicit: `offthreadStalls` and `pickHits` are MONOTONIC (never reset in
+  `frame()`); every other field is PER-FRAME (reset each `frame()`). NO stats field
+  is renamed in 2.0.0. Additive stats fields remain a minor bump (not covered by
+  LANE_VERSION).
+- **FLAGS bit 4 BILLBOARD formally RESERVED.** No draw consumer in 2.0.0. Its bit
+  ordinal, public setter (`setBillboard`), `addNode({ billboard })` init, and the
+  Billboard arena tag are all kept intact and in lockstep so a D8 Sprites consumer
+  can walk the set in O(members) via joinN without a flags-word renumber. Nothing
+  is removed -- this is a freeze-record clarification, NOT a breaking change.
+
+### Decision record (measured justification for the freeze)
+
+Residual 1 -- depth curve. Ruled: keep the incumbent LINEAR curve. Fixture: 4000
+faces, 4 layers, near=1, 70% of `|centroidViewZ|` in `[near, 4*near]`. Inversions =
+Kendall discordant same-layer pairs vs an exact f64 oracle; ties = faces sharing a
+packed 26-bit depth key.
+
+| far/near | linear inversions | linear ties | 1/z inversions | 1/z ties | linear ns/call | 1/z ns/call |
+|---------:|------------------:|------------:|---------------:|---------:|---------------:|------------:|
+| 100 | 0 | 6 | 0 | 2 | 1.553 | 6.581 |
+| 1000 | 0 | 22 | 0 | 6 | 1.393 | 6.611 |
+| 10000 | 0 | 84 | 0 | 20 | 5.520 | 8.458 |
+
+Both curves produce ZERO same-layer inversions at every ratio; neither reorders
+faces. The 1/z curve resolves ~3-4x fewer near-camera ties but costs ~4x per call
+on the hot collect path (7 call sites). The incumbent linear curve is kept.
+
+Residual 2 -- layer/depth split. Ruled: keep the incumbent 6/26 split. Units of
+view-space per depth step under the linear curve (near=1):
+
+| split (layer/depth) | layers | depth steps | units/step @100 | @1000 | @10000 |
+|--------------------:|-------:|------------:|----------------:|------:|-------:|
+| 5 / 27 | 32 | 134,217,728 | 7.376e-7 | 7.443e-6 | 7.450e-5 |
+| 6 / 26 (chosen) | 64 | 67,108,864 | 1.475e-6 | 1.489e-5 | 1.490e-4 |
+| 7 / 25 | 128 | 33,554,432 | 2.950e-6 | 2.977e-5 | 2.980e-4 |
+
+Peak distinct-layer utilization across the whole suite is 4 (max layer assigned is
+3); 64 layers has never been approached. The 6/26 split is frozen.
+
 ## [1.9.0] - 2026-09-13
 
 Roadmap D6.5 "spend the lanes D5 already paid for, before the freeze": the final

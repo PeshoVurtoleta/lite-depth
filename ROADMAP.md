@@ -1138,7 +1138,7 @@ version_target: 1.9.0   # authored 2026-09-13 with the true target; the historic
                         # D1-D7 one-minor drift (line 425) is an artifact of rev-3
                         # authoring before D0 landed and does NOT apply to briefs
                         # authored after. Ships as 1.9.0.
-status: planned
+status: SHIPPED (v1.9.0, 2026-09-13)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -1147,6 +1147,14 @@ peers: ["@zakkster/lite-gc-profiler"]
 findings: []
 depends_on: [D4, D5]
 ---
+
+<!-- SHIPPED (v1.9.0, 2026-09-13): pipeline clean planner->coder->reviewer(APPROVED)
+     ->qa(PASS); released + published. setMaterialOverride rides a NEW per-node
+     matEff Int32Array lane (NOT the D5 per-draw-transient matOverride -- see the
+     AS BUILT note below); matEff excluded from _sendLaneKeys so off-thread round
+     trips never drop overrides. stats.facesClipped (per-frame) + stats.pickHits
+     (monotonic) added. test/23-material-override.test.js: +20 cases. Gate: tests
+     215/0 (+3 --expose-gc skips), torture ok 0 B/op maxMajor 0 parity 8. -->
 
 # lite-depth -- spend the lanes D5 already paid for, before the freeze
 
@@ -1281,8 +1289,22 @@ TASKS
   - **Residual 3, decided:** the layer bit budget. 6 bits / 26 bits of depth is
     the current split. Confirm against a real scene's layer needs before freezing;
     once `LANE_VERSION` ships, changing it is another major.
-  - Freeze the `FLAGS` bit assignment as part of the spec. Any bit not consumed
-    by code at this point is REMOVED (D-14 closed either way).
+  - Freeze the `FLAGS` bit assignment as part of the spec. Any bit that is
+    neither consumed by code NOR explicitly reserved with a dated milestone
+    comment naming the session that will consume it is REMOVED (D-14 closed).
+    <!-- RULED (2026-09-13, user): BILLBOARD (bit 4) is RESERVED, not removed.
+    No draw consumer in 2.0.0. Leave the bit AND its ordinal exactly where they
+    are; keep setBillboard / addNode({ billboard }) and the arena-tag lockstep
+    maintained, so a D8 "Sprites" consumer can walk the set in O(members) via
+    joinN WITHOUT a flags-word renumber and without re-plumbing tag maintenance.
+    Removing it would shift CAST_SHADOW/DOUBLE_SIDED/STROKE down and force a
+    second major when the consumer lands -- that cost is REJECTED. Requirements:
+    (1) the reserved bit's declaration in Depth.js carries a `// reserved: D8
+    Sprites` comment IN SOURCE (not only llms.txt); (2) LANES.md + the decision
+    record state the reservation and the rejected-renumber rationale verbatim;
+    (3) the conformance test asserts every FLAGS bit is EITHER consumed by a code
+    path OR carries a source comment naming a future session -- so no future dead
+    bit slips the freeze silently. -->
   - Assert `aabb2.FORMAT_VERSION` at stage creation and export lite-depth's own
     `FORMAT_VERSION` re-export so a consumer can detect a substrate skew without
     importing lite-aabb directly. Fail closed on mismatch: throw at

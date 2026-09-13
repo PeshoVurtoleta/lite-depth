@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.9.0
+# @zakkster/lite-depth v2.0.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -23,11 +23,30 @@ Optional cold-path peers: lite-signal (DI), lite-raf, lite-clock, lite-sprite-ca
 
     import { createStage, geometry, material, materialFromRamp,
              createCamera, updateCamera, mathKernels, FLAGS, TAU,
-             version, FORMAT_VERSION }
+             version, LANE_VERSION, FORMAT_VERSION }
       from '@zakkster/lite-depth';
 FORMAT_VERSION re-exports @zakkster/lite-aabb's packed-format contract version
 (the [minX,minY,maxX,maxY] float32x4 layout the node-box lane + scene-bbox merge
 depend on). createStage asserts it === 1 and throws if the peer ever drifts.
+
+## Frozen binary contract (LANE_VERSION)
+
+- LANE_VERSION (currently 1) is the frozen binary-contract version, on a SEPARATE
+  axis from `version` -- the two never track each other. LANES.md is the normative
+  spec. LANE_VERSION covers: the per-node arena lane set (names + TypedArray
+  types), the FLAGS bit assignment, the packKey sort-key layout (6 layer bits << 26
+  | 26 depth bits) + the LINEAR-in-viewZ quantize curve, the frame-arena layout +
+  the 3 cold draw sentinels (DRAW_STROKE/DRAW_CLIP/DRAW_SHADOW), and the D6 Worker
+  wire (23-key transfer set + worldNonUnif). It does NOT cover: stats field values
+  or additive stats fields (a minor bump), geometry-store fields, capacity options,
+  the packed node-box layout (delegated to lite-aabb FORMAT_VERSION), or Motion.js.
+- matEff (the persistent per-node material-override lane) is a MEMBER of the
+  per-node lane set but a NON-MEMBER of the Worker transfer set: it MUST NOT be
+  transferred, so an off-thread round trip cannot observe or drop an override.
+- FLAGS bit 4 BILLBOARD is RESERVED (no draw consumer in 2.0.0). Its public setter
+  (setBillboard), the addNode({billboard}) init, and the Billboard arena tag are
+  kept in lockstep so a D8 Sprites consumer can walk the set without a flags-word
+  renumber. See LANES.md for the full FLAGS freeze table.
 
 ## createStage(ctx, opts) -> Stage
 
@@ -87,7 +106,11 @@ fill:false + stroke gives a wireframe; fill:true + stroke gives fill-then-outlin
     stage.setQuaternion(h, x, y, z, w)
     stage.setEuler(h, ex, ey, ez)          // XYZ, radians
     stage.setParent(h, parentHandle)       // 0/undefined = root; cold topo rebuild
-    stage.setLayer(h, 0..63)               // high bits of the sort key
+    stage.setLayer(h, 0..63)               // high bits of the sort key. 2.0.0
+                                           // BREAKING: a layer outside 0..63 now
+                                           // THROWS (fail-closed, did-you-mean),
+                                           // was a silent & 63 wrap. addNode's
+                                           // {layer} init fails closed the same way.
     stage.setDepthBias(h, bias)            // added to viewZ before quantize (popping fix)
     stage.setVisible(h, bool)
     stage.setPickable(h, bool)             // D5: bit + Pickable tag in lockstep
@@ -420,8 +443,8 @@ Motion gotchas:
 
 ## Test / bench
 
-    npm test          # node:test (6 files: core 01/03/04, motion 06/07/09);
-                      # both zero-GC tests skip without --expose-gc
+    npm test          # node:test (20 files: core/pipeline/zero-GC 01/03/04/10-23,
+                      # motion 06/07/09); the zero-GC tests skip without --expose-gc
     npm run test:gc   # --expose-gc; zero-GC contracts engage
     npm run torture   # node --expose-gc test/torture.mjs -> prints "ok" (zero-GC gate)
     npm run bench     # vs Zdog + throughput sweep

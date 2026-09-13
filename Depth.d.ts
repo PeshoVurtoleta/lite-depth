@@ -10,6 +10,15 @@ export const TAU: number;
 export const version: string;
 
 /**
+ * Frozen binary-contract version (D7 "Freeze"). On a SEPARATE axis from
+ * `version` -- the two never track each other. Covers the per-node arena lane
+ * set, the FLAGS bit assignment, the packKey sort-key layout + linear quantize
+ * curve, the frame-arena layout + draw sentinels, and the Worker wire. See
+ * LANES.md for the normative spec.
+ */
+export const LANE_VERSION: number;
+
+/**
  * The @zakkster/lite-aabb packed-format contract version, re-exported. The
  * per-node screen-box lane and the once-per-frame scene-bbox merge depend on the
  * [minX,minY,maxX,maxY] float32x4 layout being format 1; createStage asserts it.

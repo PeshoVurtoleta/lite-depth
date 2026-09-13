@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-depth -- Zero-GC Canvas2D software-projected 3D (v1.5.0 "Painter")
+ * @zakkster/lite-depth -- Zero-GC Canvas2D software-projected 3D (v2.0.0 "Freeze")
  *
  * Zdog's niche — flat-shaded, painter-sorted, stroke-friendly pseudo-3D on a 2D
  * canvas — but arena-backed and allocation-free on the frame loop. Zdog allocates
@@ -32,6 +32,19 @@ export const TAU = Math.PI * 2;
 const DEPTH_BITS = 26;               // 26-bit quantized depth key
 const DEPTH_MAX = (1 << DEPTH_BITS) - 1;
 const LAYER_SHIFT = DEPTH_BITS;      // layer occupies the high 6 bits (0..63)
+
+// Frozen binary-contract version (D7 "Freeze"). On a SEPARATE axis from the
+// semver `version` below -- the two NEVER track each other. LANES.md is the
+// normative spec. LANE_VERSION COVERS: the per-node arena lane set (names +
+// TypedArray types), the FLAGS bit assignment, the packKey sort-key layout
+// (6 layer bits << 26 | 26 depth bits) AND the linear-in-viewZ quantize curve,
+// the frame-arena lane layout + the 3 cold draw sentinels (DRAW_STROKE /
+// DRAW_CLIP / DRAW_SHADOW), and the D6 Worker wire (the 23-key _sendLaneKeys
+// transfer set + worldNonUnif). It does NOT cover: stats field values or
+// additive stats fields (a minor bump), geometry-store object fields, capacity
+// options, the packed node-box layout (delegated to lite-aabb FORMAT_VERSION),
+// or Motion.js. Bump only when a covered layout changes.
+export const LANE_VERSION = 1;
 
 // drawFace lane sentinels. A real face index is tiny (F per geometry), so these
 // two top-of-range values can never collide with one. Paint discriminates with a
@@ -74,7 +87,7 @@ const F_CAST_SHADOW = 1 << FLAGS.get('CAST_SHADOW');
 // consumer can walk billboards in O(members), and it is RESERVED for a screen-facing
 // billboard pass. Milestone: revisit at D8 "Sprites" (roadmap); until then the tag
 // is maintained but nothing in this module reads it.
-const F_BILLBOARD = 1 << FLAGS.get('BILLBOARD');
+const F_BILLBOARD = 1 << FLAGS.get('BILLBOARD'); // reserved: D8 Sprites (no draw consumer in 2.0.0)
 
 /* ───────────────────────── math kernels (out-param) ─────────────────────── */
 // No Vec3/Mat4 classes. Everything writes into caller buffers; module-level
@@ -336,9 +349,10 @@ export function createStage(ctx, opts) {
   // per-node screen box lane (nodeBox) and the once-per-frame scene-bbox merge
   // both assume the [minX,minY,maxX,maxY] float32x4 format (FORMAT_VERSION 1).
   if (FORMAT_VERSION !== 1) {
-    throw new Error('lite-depth: @zakkster/lite-aabb FORMAT_VERSION=' + FORMAT_VERSION +
-      ' but lite-depth is built against packed format 1 ([minX,minY,maxX,maxY]). ' +
-      'The nodeBox cull + scene-bbox merge assume that layout -- upgrade lite-depth.');
+    throw new Error('lite-depth: LANE_VERSION=' + LANE_VERSION +
+      ' expects @zakkster/lite-aabb FORMAT_VERSION=1 ([minX,minY,maxX,maxY]), ' +
+      'but observed FORMAT_VERSION=' + FORMAT_VERSION + '. The nodeBox cull + ' +
+      'scene-bbox merge assume that packed layout -- upgrade lite-depth.');
   }
   const o = opts || {};
   let maxNodes = o.maxNodes || 4096;
@@ -660,7 +674,16 @@ export function createStage(ctx, opts) {
       if (init.x !== undefined) D.px[d] = init.x;
       if (init.y !== undefined) D.py[d] = init.y;
       if (init.z !== undefined) D.pz[d] = init.z;
-      if (init.layer !== undefined) D.layer[d] = init.layer;
+      if (init.layer !== undefined) {
+        // Fail closed (BREAKING in 2.0.0): a layer outside 0..63 was silently
+        // & 63-wrapped before. Cold path (addNode), so the guard costs nothing
+        // per frame. Number.isInteger rejects null, NaN, undefined, and any
+        // non-integer (e.g. 2.5) -- null is not zero.
+        const L = init.layer;
+        if (!(Number.isInteger(L) && L >= 0 && L <= 63)) throw new Error('lite-depth: layer=' + L +
+          ' out of range -- a painter layer must be an integer in 0..63 (64 layers). Did you mean layer: ' + ((L | 0) & 63) + '?');
+        D.layer[d] = L;
+      }
       if (init.parent) D.parent[d] = init.parent;
       if (init.pickable) D.flags[d] |= F_PICKABLE;
       if (init.castShadow) D.flags[d] |= F_CAST_SHADOW;
@@ -707,7 +730,15 @@ export function createStage(ctx, opts) {
     D.flags[d] |= F_DIRTY;
   };
   stage.setParent = (h, parentHandle) => { const d = nodes.idx(h); nodes.data.parent[d] = parentHandle || 0; nodes.data.flags[d] |= F_DIRTY; stage._topoDirty = true; _structureEpoch = (_structureEpoch + 1) >>> 0; };
-  stage.setLayer = (h, layer) => { nodes.data.layer[nodes.idx(h)] = layer & 63; };
+  stage.setLayer = (h, layer) => {
+    // Fail closed (BREAKING in 2.0.0): outside 0..63 was silently & 63-wrapped.
+    // Cold setter -- no per-frame cost. packKey's & 63 stays as the defensive
+    // mask but is now unreachable with a bad value. Number.isInteger rejects
+    // null, NaN, undefined, and non-integers (e.g. 2.5) -- null is not zero.
+    if (!(Number.isInteger(layer) && layer >= 0 && layer <= 63)) throw new Error('lite-depth: layer=' + layer +
+      ' out of range -- a painter layer must be an integer in 0..63 (64 layers). Did you mean setLayer(h, ' + ((layer | 0) & 63) + ')?');
+    nodes.data.layer[nodes.idx(h)] = layer;
+  };
   stage.setDepthBias = (h, bias) => { nodes.data.bias[nodes.idx(h)] = bias; };
   stage.setVisible = (h, v) => { const d = nodes.idx(h), D = nodes.data; if (v) D.flags[d] |= F_VISIBLE; else D.flags[d] &= ~F_VISIBLE; };
   // D5 flag setters: mutate the per-node bit AND the mirror tag in lockstep (see the
@@ -2147,4 +2178,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.9.0';
+export const version = '2.0.0';
