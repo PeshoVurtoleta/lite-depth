@@ -1,4 +1,4 @@
-# @zakkster/lite-depth v1.8.0
+# @zakkster/lite-depth v1.9.0
 
 Zero-GC Canvas2D software-projected 3D. Zdog's niche (flat-shaded, painter-sorted
 pseudo-3D on a 2D canvas), arena-backed and allocation-free per frame. Single-file
@@ -93,6 +93,13 @@ fill:false + stroke gives a wireframe; fill:true + stroke gives fill-then-outlin
     stage.setPickable(h, bool)             // D5: bit + Pickable tag in lockstep
     stage.setCastShadow(h, bool)           // D5: bit + ShadowCaster tag in lockstep
     stage.setBillboard(h, bool)            // D5: bit + Billboard tag (tag reserved; see below)
+    stage.setMaterialOverride(h, matId)    // D6.5: persistent per-node material; -1
+                                           // restores the node's own material. COLD,
+                                           // fail-closed: dead handle or unknown matId
+                                           // throws (with the valid id range), never a
+                                           // silent clamp. Shadow fills keep the stage shadow
+                                           // material -- an override never leaks into
+                                           // a caster's ground shadow.
     stage.remove(h)                        // generational: stale handle invalidates
     stage.resize(w, h, dpr?)
 Stale handles after remove() are safe: isAlive(h) is false, never aliases a
@@ -135,11 +142,21 @@ matrix). A parent CYCLE throws from the cold topo rebuild, naming both nodes.
     //       shadowFacesDrawn,  // D5: flat ground-shadow faces painted this frame,
     //                          // counted APART from facesDrawn so a caster is never
     //                          // double-counted (its own faces stay in facesDrawn)
-    //       offthreadStalls }  // D6: monotonic RUN counter of frames SKIPPED because
+    //       offthreadStalls,   // D6: monotonic RUN counter of frames SKIPPED because
     //                          // a bound Worker had not yet returned the transform
     //                          // buffers (fail-closed stall; canvas keeps last paint).
     //                          // Incremented on a stall, never reset in frame(). 0
     //                          // when no Worker is bound.
+    //       facesClipped,      // D6.5: PER-FRAME (reset each frame() like facesDrawn):
+    //                          // faces the near-plane clip pass actually emitted a
+    //                          // clipped polygon for this frame. Distinct from
+    //                          // facesCulled (whole-face near reject). 0 when
+    //                          // clipNear is false or nothing straddles near.
+    //       pickHits }         // D6.5: MONOTONIC (like offthreadStalls, never reset in
+    //                          // frame()): successful pick() resolutions (a pick that
+    //                          // returned 1) since stage creation. Picking is
+    //                          // pointer-driven, not per-frame, so a running total
+    //                          // maps; a missed pick does not increment it.
 
 ## Per-node screen cull + dirty-rect (v1.5.0)
 

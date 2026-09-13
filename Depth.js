@@ -368,7 +368,15 @@ export function createStage(ctx, opts) {
     m8: Float64Array, m9: Float64Array, m10: Float64Array, m11: Float64Array,
     parent: Int32Array,       // parent entity handle (0 = root)
     geom: Int32Array,         // geometry id
-    mat: Int32Array,          // material id
+    mat: Int32Array,          // material id (the node's OWN material)
+    // matEff: per-node PERSISTENT effective material (D6.5). Distinct from
+    // matOverride, which is the per-FRAME transient draw lane (Uint16, maxDrawFaces)
+    // the shadow pass and paint read: matEff is per-NODE cold storage that survives
+    // frames and drives every emit. addNode seeds it to mat[d]; setMaterialOverride
+    // repoints it (or -1 restores mat[d]). It grows / swap-pops for free with the
+    // arena and is NEVER in the Worker transfer set, so an off-thread round trip
+    // cannot drop an override. D7 will freeze this lane in LANES.md.
+    matEff: Int32Array,       // effective material id (persistent override lane)
     flags: Uint32Array,       // lite-fastbit32 layout
     layer: Uint8Array,        // 0..63 painter layer
     bias: Float64Array,       // depth bias (view-space units)
@@ -565,7 +573,7 @@ export function createStage(ctx, opts) {
     // path, no cost to the fully-front fast path either way.
     clipNear: true,
     _signals: null,
-    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0, shadowFacesDrawn: 0, offthreadStalls: 0 },
+    stats: { facesDrawn: 0, facesCulled: 0, nodesCulled: 0, drawCalls: 0, tTransform: 0, tProject: 0, tSort: 0, tPaint: 0, facesOverflowed: 0, nodesInvalid: 0, nodesNonUniform: 0, nodesOrphaned: 0, nodesTotal: 0, shadowFacesDrawn: 0, offthreadStalls: 0, facesClipped: 0, pickHits: 0 },
     _topoDirty: true,
     // read-only views of the current draw ordering (observation handles only).
     // Accessors declared in the literal so they are part of the stage's initial
@@ -615,6 +623,29 @@ export function createStage(ctx, opts) {
     _shadowMat = matId; return stage;
   };
 
+  // Persistent per-node material override (D6.5). COLD: a single lane write on a
+  // user action (selection / damage / LOD tint). matId repoints the node's
+  // effective material; -1 restores the node's OWN material (D.mat[d], the
+  // default). Fail closed on every unverified state, BEFORE any write:
+  //   - a dead / recycled handle is rejected (isAlive), never aliasing a slot the
+  //     arena has re-handed out;
+  //   - an unknown matId is an error with a did-you-mean hint, never a silent
+  //     clamp to 0 (null is not zero).
+  // This drives the collect/off-thread emit and the near-clip emit via the matEff
+  // lane; the shadow pass keeps writing the stage shadow material, so a caster's
+  // override never leaks into its ground shadow and vice versa.
+  stage.setMaterialOverride = (h, matId) => {
+    if (!arena.isAlive(h)) {
+      throw new Error('lite-depth: setMaterialOverride(h, matId) refused -- handle ' + h + ' is dead or recycled (isAlive check). A stale handle must never repoint a live node\'s material.');
+    }
+    if (matId !== -1 && !(Number.isInteger(matId) && matId >= 0 && matId < materials.length)) {
+      throw new Error('lite-depth: setMaterialOverride(h, matId) needs a registered material id (0..' + (materials.length - 1) + ') or -1 to clear, got ' + matId);
+    }
+    const d = nodes.idx(h);
+    nodes.data.matEff[d] = matId === -1 ? nodes.data.mat[d] : matId;
+    return stage;
+  };
+
   stage.addNode = (geomId, matId, init) => {
     const h = arena.spawn();
     const d = nodes.add(h);
@@ -622,7 +653,7 @@ export function createStage(ctx, opts) {
     D.px[d] = 0; D.py[d] = 0; D.pz[d] = 0;
     D.qx[d] = 0; D.qy[d] = 0; D.qz[d] = 0; D.qw[d] = 1;
     D.sx[d] = 1; D.sy[d] = 1; D.sz[d] = 1;
-    D.parent[d] = 0; D.geom[d] = geomId; D.mat[d] = matId;
+    D.parent[d] = 0; D.geom[d] = geomId; D.mat[d] = matId; D.matEff[d] = matId;
     D.flags[d] = F_VISIBLE | F_DIRTY | (geometries[geomId].kind === 'stroke' ? F_STROKE : 0);
     D.layer[d] = 0; D.bias[d] = 0;
     if (init) {
@@ -908,7 +939,7 @@ export function createStage(ctx, opts) {
         const d = drawNode[order[i]];
         if (pickMark[d] === s) {
           const j = d << 2;
-          if (x >= nodeBox[j] && x <= nodeBox[j + 2] && y >= nodeBox[j + 1] && y <= nodeBox[j + 3]) { out[0] = d; return 1; }
+          if (x >= nodeBox[j] && x <= nodeBox[j + 2] && y >= nodeBox[j + 1] && y <= nodeBox[j + 3]) { out[0] = d; stage.stats.pickHits++; return 1; }
         }
       }
       return 0;
@@ -916,7 +947,7 @@ export function createStage(ctx, opts) {
     for (let i = dc - 1; i >= 0; i--) {
       const d = drawNode[order[i]];
       const j = d << 2;
-      if (x >= nodeBox[j] && x <= nodeBox[j + 2] && y >= nodeBox[j + 1] && y <= nodeBox[j + 3]) { out[0] = d; return 1; }
+      if (x >= nodeBox[j] && x <= nodeBox[j + 2] && y >= nodeBox[j + 1] && y <= nodeBox[j + 3]) { out[0] = d; stage.stats.pickHits++; return 1; }
     }
     return 0;
   };
@@ -1096,7 +1127,7 @@ export function createStage(ctx, opts) {
     const D = nodes.data, count = nodes.count;
     if (stage._topoDirty) rebuildTopo();
     const st = stage.stats;
-    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0; st.shadowFacesDrawn = 0;
+    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0; st.shadowFacesDrawn = 0; st.facesClipped = 0;
     // Observability hooks. Integer stores OUTSIDE both hot loops: nodesTotal is
     // the live node count; facesOverflowed is reset here and fires per NODE in the
     // collect pass (the overflow door); nodesInvalid is reset here and now fires
@@ -1110,7 +1141,7 @@ export function createStage(ctx, opts) {
     // cache lane refs (monomorphic locals)
     const px = D.px, py = D.py, pz = D.pz, qx = D.qx, qy = D.qy, qz = D.qz, qw = D.qw, sx = D.sx, sy = D.sy, sz = D.sz;
     const m0 = D.m0, m1 = D.m1, m2 = D.m2, m3 = D.m3, m4 = D.m4, m5 = D.m5, m6 = D.m6, m7 = D.m7, m8 = D.m8, m9 = D.m9, m10 = D.m10, m11 = D.m11;
-    const flags = D.flags, geomL = D.geom, matL = D.mat, layerL = D.layer, biasL = D.bias;
+    const flags = D.flags, geomL = D.geom, matEffL = D.matEff, layerL = D.layer, biasL = D.bias;
 
     /* transform: recompute world 3x4 for dirty subtrees (topo order) */
     let t = clock.now();
@@ -1255,7 +1286,7 @@ export function createStage(ctx, opts) {
         }
         // one draw entry for the whole polyline at its centre depth
         drawKey[dc] = packKey(layerL[d], quantize(cvz + bias, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; matOverride[dc] = matL[d]; dc++;
+        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; matOverride[dc] = matEffL[d]; dc++;
         continue;
       }
 
@@ -1296,7 +1327,7 @@ export function createStage(ctx, opts) {
       //     the same inverse-transpose gl-matrix's normalFromMat4 builds) ONCE into
       //     _NM here; each face then does N*n, normalize, dot -- the per-face sqrt
       //     is paid only by tainted nodes, never by the uniform majority.
-      const matK1 = materials[matL[d]].K - 1;
+      const matK1 = materials[matEffL[d]].K - 1;
       const tainted = worldNonUnif[d];   // branch selector: own OR inherited non-uniform
       let Lbx = 0, Lby = 0, Lbz = 0;
       if (tainted !== 0) {
@@ -1370,7 +1401,7 @@ export function createStage(ctx, opts) {
         if (area >= 0 && (flags[d] & F_DOUBLE) === 0) { st.facesCulled++; continue; }
         const cz = czSum / n + bias;
         drawKey[dc] = packKey(layerL[d], quantize(cz, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = fi; matOverride[dc] = matL[d];
+        drawNode[dc] = d; drawFace[dc] = fi; matOverride[dc] = matEffL[d];
         // bake the shade into the draw lane. Uniform: one sqrt-free dot with the
         // back-rotated light (which already carries the world transform). Tainted:
         // transform the local normal by the per-node normal matrix, normalize, and
@@ -1471,13 +1502,13 @@ export function createStage(ctx, opts) {
     // compose, then SKIP the project and count the frame as a stall.
     if (!_workerPrimed) { _offthreadSend(count); st.offthreadStalls++; return st; }
     const D = nodes.data;
-    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0; st.shadowFacesDrawn = 0;
+    st.facesDrawn = 0; st.facesCulled = 0; st.nodesCulled = 0; st.drawCalls = 0; st.shadowFacesDrawn = 0; st.facesClipped = 0;
     st.facesOverflowed = 0; st.nodesInvalid = 0; st.nodesNonUniform = 0; st.nodesTotal = count;
 
     // cache lane refs (monomorphic locals)
     const px = D.px, py = D.py, pz = D.pz, qx = D.qx, qy = D.qy, qz = D.qz, qw = D.qw, sx = D.sx, sy = D.sy, sz = D.sz;
     const m0 = D.m0, m1 = D.m1, m2 = D.m2, m3 = D.m3, m4 = D.m4, m5 = D.m5, m6 = D.m6, m7 = D.m7, m8 = D.m8, m9 = D.m9, m10 = D.m10, m11 = D.m11;
-    const flags = D.flags, geomL = D.geom, matL = D.mat, layerL = D.layer, biasL = D.bias;
+    const flags = D.flags, geomL = D.geom, matEffL = D.matEff, layerL = D.layer, biasL = D.bias;
     // transform is composed OFF-THREAD; the world matrices in m0..m11 are the
     // Worker's reply to the previous send. No main-thread transform loop.
     st.tTransform = 0;
@@ -1589,7 +1620,7 @@ export function createStage(ctx, opts) {
         }
         // one draw entry for the whole polyline at its centre depth
         drawKey[dc] = packKey(layerL[d], quantize(cvz + bias, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; matOverride[dc] = matL[d]; dc++;
+        drawNode[dc] = d; drawFace[dc] = 0xFFFFFFFF; matOverride[dc] = matEffL[d]; dc++;
         continue;
       }
 
@@ -1630,7 +1661,7 @@ export function createStage(ctx, opts) {
       //     the same inverse-transpose gl-matrix's normalFromMat4 builds) ONCE into
       //     _NM here; each face then does N*n, normalize, dot -- the per-face sqrt
       //     is paid only by tainted nodes, never by the uniform majority.
-      const matK1 = materials[matL[d]].K - 1;
+      const matK1 = materials[matEffL[d]].K - 1;
       const tainted = worldNonUnif[d];   // branch selector: own OR inherited non-uniform
       let Lbx = 0, Lby = 0, Lbz = 0;
       if (tainted !== 0) {
@@ -1704,7 +1735,7 @@ export function createStage(ctx, opts) {
         if (area >= 0 && (flags[d] & F_DOUBLE) === 0) { st.facesCulled++; continue; }
         const cz = czSum / n + bias;
         drawKey[dc] = packKey(layerL[d], quantize(cz, near, far, zSpan));
-        drawNode[dc] = d; drawFace[dc] = fi; matOverride[dc] = matL[d];
+        drawNode[dc] = d; drawFace[dc] = fi; matOverride[dc] = matEffL[d];
         // bake the shade into the draw lane. Uniform: one sqrt-free dot with the
         // back-rotated light (which already carries the world transform). Tainted:
         // transform the local normal by the per-node normal matrix, normalize, and
@@ -1918,10 +1949,13 @@ export function createStage(ctx, opts) {
     if (ndl < 0) ndl = 0; else if (ndl > 1) ndl = 1;
     // emit one draw entry; clipRef packs (startVert << 5) | vertCount (outN <= 16).
     drawKey[dc] = packKey(layer, quantize(czSum / outN + bias, near, far, zSpan));
-    drawNode[dc] = d; drawFace[dc] = DRAW_CLIP; matOverride[dc] = D.mat[d];
+    drawNode[dc] = d; drawFace[dc] = DRAW_CLIP; matOverride[dc] = D.matEff[d];
     clipRef[dc] = (w0 << 5) | outN;
     shadeL[dc] = (ndl * matK1) | 0;
     _clipWrite = w0 + outN;
+    // A clipped polygon is actually emitted here (cold straddle path only). Count
+    // it: facesClipped is per-frame, distinct from facesCulled (whole-face reject).
+    st.facesClipped++;
     return dc + 1;
   }
 
@@ -2113,4 +2147,4 @@ export function createStage(ctx, opts) {
   return stage;
 }
 
-export const version = '1.8.0';
+export const version = '1.9.0';

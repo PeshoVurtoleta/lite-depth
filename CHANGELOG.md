@@ -4,6 +4,38 @@ All notable changes to `@zakkster/lite-depth` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] - 2026-09-13
+
+Roadmap D6.5 "spend the lanes D5 already paid for, before the freeze": the final
+additive feature set before the D7 lane-spec freeze. No new FLAGS bit, no sort-key
+change, no wire-layout change -- the D7 freeze surface is untouched.
+
+### Added
+
+- **`stage.setMaterialOverride(h, matId)`** -- a persistent per-node material override
+  for selection / damage / LOD tint. `matId` repoints the node's effective material;
+  `-1` restores the node's own material (the default). COLD, fail-closed: a dead or
+  recycled handle is rejected (`isAlive`) before any write, and an unknown `matId`
+  throws with the valid id range (never a silent clamp to 0). Backed by a new
+  per-node `matEff` lane (persistent cold storage, distinct from the per-frame
+  transient `matOverride` draw lane); the lane is never in the Worker transfer set,
+  so an off-thread round trip cannot drop an override. The shadow pass still paints
+  the stage shadow material, so an override never leaks into a caster's ground shadow
+  (nor the reverse).
+- **`stats.facesClipped`** -- PER-FRAME (reset each `frame()` like `facesDrawn`): faces
+  the near-plane clip pass actually emitted a clipped polygon for this frame, distinct
+  from `facesCulled` (whole-face near reject). 0 when `clipNear` is false or nothing
+  straddles the near plane.
+- **`stats.pickHits`** -- MONOTONIC (like `offthreadStalls`, never reset in `frame()`):
+  successful `pick()` resolutions since stage creation. A missed pick does not
+  increment it; `pickRect`/`pickRay`/`pickSet`/`nearest` do not touch it.
+
+### Unchanged (proven)
+
+- With no override set and no near straddle the frame body is byte-identical to 1.8.0:
+  the emit sites are a pure read swap (`matEff[d]` for `mat[d]`), no added branch. The
+  torture gate holds 0 B/op with `maxMajor 0`.
+
 ## [1.8.0] - 2026-09-13
 
 Roadmap D6 "Offthread": an opt-in, DI path that moves the transform pass off the main

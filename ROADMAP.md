@@ -1024,7 +1024,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-depth"
 version_target: 1.7.0
-status: planned
+status: SHIPPED (v1.8.0, 2026-09-13)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -1125,6 +1125,117 @@ NON-GOALS
 DONE WHEN
   the round trip is proven across a real thread boundary, twice; a detached lane
   is never read; the stall policy is recorded with its memory cost
+```
+
+===============================================================================
+# D6.5 -- lite-depth v1.9.0 -- backlog: material override + telemetry counters
+===============================================================================
+
+```markdown
+---
+package: "@zakkster/lite-depth"
+version_target: 1.9.0   # authored 2026-09-13 with the true target; the historical
+                        # D1-D7 one-minor drift (line 425) is an artifact of rev-3
+                        # authoring before D0 landed and does NOT apply to briefs
+                        # authored after. Ships as 1.9.0.
+status: planned
+gc_maxMajor: 0
+gc_maxPauseMs: 4
+alloc_bytes_per_op: 0
+leak_cycles: 4096
+peers: ["@zakkster/lite-gc-profiler"]
+findings: []
+depends_on: [D4, D5]
+---
+
+# lite-depth -- spend the lanes D5 already paid for, before the freeze
+
+PURPOSE
+  Two of the items approved in the post-v1.7.0 external-review backlog (section 8)
+  touch NO frozen surface: they ride infrastructure D4/D5 already built. Landing
+  them as a non-breaking 1.9.0 BEFORE D7 means the v2.0.0 freeze locks the binary
+  contract down over the final feature set, not a partial one. Neither item
+  consumes a FLAGS bit, changes the sort key, or renames a lane -- so neither is
+  D7-gated (unlike the presentation items, which read the frozen key or a frozen
+  bit and must wait for LANE_VERSION).
+
+AS BUILT (reconciled 2026-09-13, post-pipeline): the premise below that
+  setMaterialOverride rides "the existing matOverride Uint16 lane" was FACTUALLY
+  WRONG -- the planner verified that `matOverride` is a per-DRAW-FACE TRANSIENT
+  (Uint16, maxDrawFaces), refilled every emit, so it cannot hold a persistent
+  per-node override. A persistent override genuinely needs per-node state, so the
+  shipped design adds a new per-node SoA lane `matEff: Int32Array` that the emit
+  sites read (a pure read swap, no new hot-body branch/bytes). This is the minimal
+  correct fix and stays off the D7 freeze surface (no sort-key, no FLAGS bit, no
+  DRAW-wire change; matEff is excluded from the Worker transfer set). D7/LANES.md
+  will freeze matEff as part of the final per-node lane spec -- which is exactly why
+  landing it pre-freeze is correct. Reviewer accepted it as contract-faithful.
+
+TASKS
+  - `stage.setMaterialOverride(h, matId | -1)` -- COLD setter over the existing
+    `matOverride` Uint16 lane (added in D5 for the shadow pass; paint already reads
+    `matOverride[e]` for every fill). -1 clears the override (paint falls back to the
+    node's own material, the current default). Use for selection / damage / LOD tint.
+    Fail closed: an unknown matId is an error with a did-you-mean hint (never a
+    silent clamp to 0); a dead/recycled handle is rejected (isAlive check), never
+    aliases a recycled slot. Per-FACE override is explicitly OUT (it would need a
+    per-face lane and break paint's style-run batching -- rejected in section 8).
+    The shadow pass owns `matOverride` during its own pass; document and test the
+    interaction (a caster's override must not leak into its ground-shadow fill,
+    which is keyed to the stage shadow material, and vice versa).
+  - Telemetry counters, matching the fail-closed counter philosophy
+    (`shadowFacesDrawn` / `offthreadStalls` are the precedents). Cold increments
+    only, no per-frame string build:
+      - `stats.facesClipped` -- PER-FRAME (reset each frame() like facesDrawn):
+        faces the near-plane Sutherland-Hodgman pass actually clipped this frame
+        (a straddling face that produced a clipped polygon), distinct from
+        facesCulled (whole-face near reject). 0 when clipNear is off.
+      - `stats.pickHits` -- MONOTONIC (like offthreadStalls, never reset in
+        frame()): successful pick() resolutions since stage creation (a pick that
+        returned 1). Picking is pointer-event-driven, not per-frame, so a per-frame
+        reset would not map; a running total does. Document the monotonic semantics
+        in llms.txt exactly as offthreadStalls is documented.
+
+HOT PATH
+  setMaterialOverride is cold (a single lane write on a user action). The paint read
+  of matOverride[e] ALREADY exists -- this task adds NO new per-face branch.
+  facesClipped is one integer increment on the ALREADY-cold straddle path (the
+  fully-front fast path never touches it, stays byte-identical). pickHits is one
+  increment inside the existing pick() success return, off the frame loop entirely.
+  Net hot-path delta over 1.8.0: zero. Prove it -- the torture gate must stay 0 B/op
+  and byte-identical to 1.8.0 on a scene that sets no override and triggers no clip.
+
+ASSERTIONS
+  - setMaterialOverride(h, matId) makes paint emit matId for that node's fills and
+    -1 restores the node material -- asserted by reading the draw output, not a look.
+  - setMaterialOverride with an unregistered matId THROWS (did-you-mean); with a
+    dead handle is rejected; neither mutates any lane (fail closed, proven both ways).
+  - A shadow-casting node WITH a material override: its own faces paint the override,
+    its ground-shadow faces still paint the stage shadow material (no leak either
+    direction) -- a named test for the interaction.
+  - facesClipped counts exactly the faces the near clip emitted a clipped polygon
+    for on a straddling-geometry fixture, and is 0 with clipNear=false or no straddle.
+  - pickHits increments once per successful pick() and never resets across frames;
+    a missed pick does not increment it.
+  - bytes/op 0 over 20000 frames; torture "ok"; the frame body is byte-identical to
+    1.8.0 when no override is set and nothing clips (the 1.8.0 gate numbers hold).
+  - `npm pack --dry-run` ships the same 10 files as 1.8.0 (no new shipped file --
+    both features are Depth.js-internal); excludes test/ and demo/.
+
+NON-GOALS
+  No per-face material override (needs a per-face lane; breaks style-run batching).
+  No presentation work (hemisphere/rim, dashes, blob shadows, billboards) -- all of
+  it is D7-gated because it reads the frozen key or a frozen FLAGS bit. No new
+  FLAGS bit, no sort-key change, no DRAW-wire change -- this session must leave the
+  D7 freeze surface UNTOUCHED so the freeze is over the final, complete feature set.
+  (As built: one new COLD per-node lane `matEff` was required -- see the AS BUILT
+  note above. It is not part of the sort key / FLAGS / DRAW wire, so the freeze
+  surface stays untouched; D7 folds matEff into the frozen per-node lane spec.)
+
+DONE WHEN
+  setMaterialOverride ships fail-closed with the shadow-interaction test green; both
+  counters read true against their fixtures with the documented reset semantics; the
+  1.8.0 torture numbers hold unchanged; nothing that D7 will freeze has moved.
 ```
 
 ===============================================================================
